@@ -46,12 +46,12 @@ from tts_filter import (
 
 
 st.set_page_config(
-    page_title="Slide Presentation Studio",
+    page_title="Slide Narrator",
     page_icon="🎓",
     layout="wide",
 )
 
-st.title("🎓 Slide Presentation Studio")
+st.title("🎓 Slide Narrator")
 st.caption("講義＆研究発表モード対応・日英ナレーション＆字幕連動スライド動画生成システム")
 
 
