@@ -4,14 +4,13 @@ Automated AI presenter that turns PDF slides into chaptered videos with voice, s
 講義や研究発表用のPDF形式スライドから音声付きスライドショー動画（日本語・英語字幕対応）を自動的に生成するシステムです。
  - 日本語スライド → 日本語音声＋和英字幕
  - 英語スライド → 英語音声＋和英字幕
- - 音声サンプルがあれば，その声で解説音声にできます．
  - レーザポインタ風マーカーでどこを話しているかをポイントしますので，ある程度は視聴者の視線を誘導できます．プログラムコードやベクター系の図であれば部分的にポイントはできます（期待は厳禁）．
  - 全て処理をローカル環境で済ませることが可能です（OpenAI互換APIをもったLLM/TTSサーバをローカルで稼働させてください）．以下は私が使っている環境です．
    - LLMサーバ: ollama ( https://ollama.com/ )
      - LLMは"Qwen3.8-27b ( https://huggingface.co/Qwen/Qwen3.8-27B )
    - 英語TTSサーバ: remskyさんの https://github.com/remsky/Kokoro-FastAPI 
-   - 日本語TTSサーバ: Aratakoさんの https://github.com/Aratako/Irodori-TTS-Server 
-     -　Irodori-TTS用の参照音声としてはhadouさんの　https://huggingface.co/datasets/hadou1225/Hadou-Voice-Dataset
+   - 日本語TTSサーバ: Aratakoさんの https://github.com/Aratako/Irodori-TTS-Server
+     - 参照音声としてはhadouさんの　https://huggingface.co/datasets/hadou1225/Hadou-Voice-Dataset
 
 ## セットアップ(Linuxの場合)
 ```bash
