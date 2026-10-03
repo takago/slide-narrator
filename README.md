@@ -6,7 +6,7 @@ Turn your PDF presentation slides into narrated lecture videos with AI.
  - 英語スライド → 英語音声＋和英字幕
  - レーザポインタ風マーカーでどこを話しているかをポイントしますので，ある程度は視聴者の視線を誘導できます．プログラムコードやベクター系の図であれば部分的にポイントはできます（期待は厳禁）．
  - AIが生成したナレーションが気に入らない場合は，直接手で編集できます．
- - 全て処理をローカル環境で済ませることが可能です（OpenAI互換APIをもったLLM/TTSサーバをローカルで稼働させてください）．以下は私が使っている環境です．
+ - 全ての処理をローカル環境で済ませることが可能です（OpenAI互換APIをもったLLM/TTSサーバをローカルで稼働させてください）．以下は私が使っている環境です．
    - LLMサーバ: ollama ( https://ollama.com/ )
      - LLMは"Qwen3.8-27b ( https://huggingface.co/Qwen/Qwen3.8-27B )
    - 英語TTSサーバ: remskyさんの https://github.com/remsky/Kokoro-FastAPI 
