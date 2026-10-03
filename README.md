@@ -1,5 +1,5 @@
 # slide-narrator
-Automated AI presenter that turns PDF slides into chaptered videos with voice, subtitles, and laser focus.
+Turn your PDF presentation slides into narrated lecture videos with AI.
 
 講義や研究発表用のPDF形式スライドから音声付きスライドショー動画（日本語・英語字幕対応）を自動的に生成するシステムです。
  - 日本語スライド → 日本語音声＋和英字幕
