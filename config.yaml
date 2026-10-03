@@ -1,0 +1,28 @@
+mode: lecture
+language: en
+llm:
+  base_url: http://XXXXXXXXXX:11434/v1
+  api_key: dummy
+  model: XXXXXXXXXX
+  temperature: 0.3
+tts:
+  ja:
+    base_url: http://XXXXXXXXXX:58885/v1
+    api_key: dummy
+    model: irodori-tts
+    voice: hadou
+    response_format: mp3
+  en:
+    base_url: http://XXXXXXXXXX:56885/v1
+    api_key: dummy
+    model: kokoro
+    voice: af_bella
+    response_format: mp3
+pdf:
+  dpi: 109
+video:
+  fps: 10
+  crf: 18
+  preset: medium
+  audio_codec: aac
+  audio_bitrate: 192k
