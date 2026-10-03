@@ -25,11 +25,13 @@ vi config.yaml        # OpenAI互換エンドポイントを持ったLLM，TTS�
 vi tts_filter.yaml    # OpenAI互換エンドポイントを持ったLLMを指定してください．
 ```
 
-## 起動
+## 起動(WebUI)
 ```bash
 
 streamlit run app.py
 ```
+## 起動(CLI)
+（省略）
 
 ## ライセンス (License)
 本プロジェクトは GNU General Public License v3.0 (GPLv3) の下で公開します。
