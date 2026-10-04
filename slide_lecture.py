@@ -529,6 +529,7 @@ def translate_sentences(client: OpenAI, cfg: dict, sentences: list[str], target_
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": prompt},
             ],
+            extra_body={"reasoning_effort": "none"} 
         )
         translations = extract_json(response.choices[0].message.content)
         if isinstance(translations, list) and len(translations) == len(sentences):
@@ -690,6 +691,7 @@ def align_narration_with_blocks(
                 {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": content},
             ],
+            extra_body={"reasoning_effort": "none"} 
         )
 
         data = extract_json(response.choices[0].message.content)
