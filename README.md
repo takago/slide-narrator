@@ -2,8 +2,6 @@
 Turn your PDF presentation slides into narrated lecture videos with AI.
 
 講義や研究発表用のPDF形式スライドから音声付きスライドショー動画（日本語・英語字幕対応）を自動的に生成するシステムです。
-![img](2026-10-04_13-02.png)
-
  - CLI版とWebUI版(niceguiを利用）
  - 日本語スライド → 日本語音声＋和英字幕
  - 英語スライド → 英語音声＋和英字幕
@@ -15,6 +13,8 @@ Turn your PDF presentation slides into narrated lecture videos with AI.
    - 英語TTSサーバ: remskyさんの https://github.com/remsky/Kokoro-FastAPI 
    - 日本語TTSサーバ: Aratakoさんの https://github.com/Aratako/Irodori-TTS-Server
      - 参照音声としてはhadouさんの　https://huggingface.co/datasets/hadou1225/Hadou-Voice-Dataset
+
+![img](2026-10-04_13-02.png)
 
 ## セットアップ(Linuxの場合)
 ```bash
