@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+from functools import lru_cache
 from pathlib import Path
 
 import httpx
@@ -156,6 +157,55 @@ def run(cmd: list[str]) -> None:
 def check_ffmpeg() -> None:
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg が見つかりません．PATHを確認してください．")
+
+
+@lru_cache(maxsize=1)
+def detect_best_video_encoder() -> tuple[str, list[str]]:
+    """実行環境をチェックし、利用可能な最適な動画エンコーダとオプションを返します．"""
+    try:
+        res = subprocess.run(
+            ["ffmpeg", "-encoders"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        encoders = res.stdout
+    except Exception:
+        return "libx264", ["-preset", "ultrafast"]
+
+    # 1. NVIDIA NVENC
+    if "h264_nvenc" in encoders:
+        test_cmd = [
+            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+            "-c:v", "h264_nvenc", "-f", "null", "-"
+        ]
+        if subprocess.run(test_cmd).returncode == 0:
+            print("[ENCODER] ハードウェアアクセラレーション: NVIDIA NVENC を使用します．")
+            return "h264_nvenc", ["-preset", "p1"]
+
+    # 2. Apple Silicon / macOS VideoToolbox
+    if "h264_videotoolbox" in encoders:
+        test_cmd = [
+            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+            "-c:v", "h264_videotoolbox", "-f", "null", "-"
+        ]
+        if subprocess.run(test_cmd).returncode == 0:
+            print("[ENCODER] ハードウェアアクセラレーション: Apple VideoToolbox を使用します．")
+            return "h264_videotoolbox", ["-realtime", "1"]
+
+    # 3. Intel QSV
+    if "h264_qsv" in encoders:
+        test_cmd = [
+            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+            "-c:v", "h264_qsv", "-f", "null", "-"
+        ]
+        if subprocess.run(test_cmd).returncode == 0:
+            print("[ENCODER] ハードウェアアクセラレーション: Intel Quick Sync Video (QSV) を使用します．")
+            return "h264_qsv", ["-preset", "veryfast"]
+
+    # 4. CPU (libx264)
+    print("[ENCODER] ソフトウェアエンコード: libx264 (ultrafast) を使用します．")
+    return "libx264", ["-preset", "ultrafast"]
 
 
 def load_config(path: Path) -> dict:
@@ -1019,6 +1069,23 @@ def generate_page_video(
         print(f"[VIDEO] reuse {out}")
         return
 
+    # 利用可能な最速エンコーダを自動取得
+    vcodec, encoder_opts = detect_best_video_encoder()
+
+    crf = str(cfg.get("crf", 20))
+    fps = str(cfg.get("fps", 15))
+    audio_codec = str(cfg.get("audio_codec", "aac"))
+    audio_bitrate = str(cfg.get("audio_bitrate", "192k"))
+
+    # 品質/レート制御オプション（エンコーダ別）
+    quality_opts = []
+    if vcodec == "libx264":
+        quality_opts = ["-crf", crf]
+    elif vcodec == "h264_nvenc":
+        quality_opts = ["-cq", crf]
+    elif vcodec == "h264_qsv":
+        quality_opts = ["-global_quality", crf]
+
     if not schedule:
         cmd = [
             "ffmpeg", "-y",
@@ -1028,13 +1095,13 @@ def generate_page_video(
             "-map", "0:v:0",
             "-map", "1:a:0",
             "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-c:v", "libx264",
-            "-preset", str(cfg.get("preset", "medium")),
-            "-crf", str(cfg.get("crf", 18)),
-            "-r", str(cfg.get("fps", 15)),
+            "-c:v", vcodec,
+            *encoder_opts,
+            *quality_opts,
+            "-r", fps,
             "-pix_fmt", "yuv420p",
-            "-c:a", str(cfg.get("audio_codec", "aac")),
-            "-b:a", str(cfg.get("audio_bitrate", "192k")),
+            "-c:a", audio_codec,
+            "-b:a", audio_bitrate,
             "-shortest",
             "-movflags", "+faststart",
             str(out),
@@ -1066,13 +1133,13 @@ def generate_page_video(
         "-filter_complex", filter_complex,
         "-map", "[v]",
         "-map", "2:a:0",
-        "-c:v", "libx264",
-        "-preset", str(cfg.get("preset", "medium")),
-        "-crf", str(cfg.get("crf", 18)),
-        "-r", str(cfg.get("fps", 15)),
+        "-c:v", vcodec,
+        *encoder_opts,
+        *quality_opts,
+        "-r", fps,
         "-pix_fmt", "yuv420p",
-        "-c:a", str(cfg.get("audio_codec", "aac")),
-        "-b:a", str(cfg.get("audio_bitrate", "192k")),
+        "-c:a", audio_codec,
+        "-b:a", audio_bitrate,
         "-shortest",
         "-movflags", "+faststart",
         str(out),
@@ -1344,11 +1411,9 @@ def main() -> int:
             blocks = align_data.get("blocks", [])
             alignments = align_data.get("alignments", [])
 
+            # 重複していたTTSフィルタLLM呼び出しを排除し、直接元の文を割り当て
             for item in alignments:
-                if lang == "ja":
-                    item["tts_sentence"] = apply_tts_filter(item["sentence"], filter_config_path)
-                else:
-                    item["tts_sentence"] = item["sentence"]
+                item["tts_sentence"] = item["sentence"]
 
             schedule, page_subtitles = build_pointer_schedule(blocks, alignments, duration)
             all_page_subtitles.append((accumulated_offset, page_subtitles))
