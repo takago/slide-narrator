@@ -1,7 +1,7 @@
 openai>=1.100.0
 PyMuPDF>=1.26.0
 PyYAML>=6.0
-streamlit>=1.50.0
+nicegui>=3.17.1
 Pillow>=10.0.0
 httpx
 
