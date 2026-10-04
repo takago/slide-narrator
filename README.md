@@ -18,7 +18,10 @@ Turn your PDF presentation slides into narrated lecture videos with AI.
 
 ## セットアップ(Linuxの場合)
 ```bash
-sudo apt install ffmpeg
+sudo apt install ffmpeg git
+git clone --depth 1 https://github.com/takago/slide-narrator.git
+cd slide-narrator
+
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv -p 3.10 .venv
 source .venv/bin/activate
