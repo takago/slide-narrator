@@ -294,7 +294,7 @@ with st.sidebar:
         with st.expander("処理ログ"):
             st.code(st.session_state["log"])
     st.divider()
-    st.caption("** TAKAGO LAB., KIT, Japan. **")
+    st.caption("**TAKAGO LAB., KIT, Japan.**")
     st.caption("[https://github.com/takago/slide-narrator](https://github.com/takago/slide-narrator)")
 
 # ----------------------------------------------------------------------
