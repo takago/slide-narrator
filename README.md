@@ -15,8 +15,6 @@ Turn your PDF presentation slides into narrated lecture videos with AI.
    - (3) 日本語TTSサーバ: Aratakoさんの https://github.com/Aratako/Irodori-TTS-Server
      - 参照音声としてはhadouさんの　https://huggingface.co/datasets/hadou1225/Hadou-Voice-Dataset
 
-![img](2026-10-04_13-02.png)
-
 ## セットアップ(Linuxの場合)
 ```bash
 sudo apt install ffmpeg git
@@ -28,16 +26,18 @@ uv venv -p 3.10 .venv
 source .venv/bin/activate
 uv pip install -r requirements.txt
 
+（必要に応じて）.
 vi config.yaml        # OpenAI互換エンドポイントを持ったLLM，TTSサーバを指定してください．
 vi tts_filter.yaml    # OpenAI互換エンドポイントを持ったLLMを指定してください．
 ```
+LLMとTTSの設定はWebUIからでもできます．
 
 ## 起動(WebUI)
 ```bash
 python3 app.py 
 ```
 ブラウザで接続後，(1)PDFをアップロード，(2)発表種別の選択，(3)主言語(日本語or英語)の選択を行った後，「④動画の生成」ボタンを押すだけです．
-
+![img](2026-10-04_13-02.png)
 
 ## 起動(CLI)
 （省略）
