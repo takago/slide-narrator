@@ -1,5 +1,5 @@
 mode: lecture
-language: en
+language: ja
 llm:
   base_url: http://XXXXXXXXXX:11434/v1
   api_key: dummy
