@@ -19,10 +19,10 @@ tts:
     voice: af_bella
     response_format: mp3
 pdf:
-  dpi: 109
+  dpi: 81
 video:
   fps: 10
-  crf: 18
-  preset: medium
+  crf: 26
+  preset: veryfast
   audio_codec: aac
-  audio_bitrate: 192k
+  audio_bitrate: 96k
