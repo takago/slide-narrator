@@ -27,7 +27,7 @@ vi tts_filter.yaml    # OpenAI互換エンドポイントを持ったLLMを指�
 
 ## 起動(WebUI)
 ```bash
-streamlit run app.py
+python3 app.py 
 ```
 ブラウザで接続後，(1)PDFをアップロード，(2)発表種別の選択，(3)主言語(日本語or英語)の選択を行った後，「④動画の生成」ボタンを押すだけです．
 
