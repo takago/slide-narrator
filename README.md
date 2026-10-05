@@ -1,3 +1,9 @@
+> Note on the Project Name
+> I chose the name slide-narrator when I created this repository, and only later discovered that several unrelated > projects and packages use the same name. This project is independent of those projects.
+
+> プロジェクト名について
+> このリポジトリを作成した際に slide-narrator という名前を付けましたが，その後，同じ名前を使用している無関係のプロジェクトやパッケージ> がいくつか存在することに気付きました．本プロジェクトは，それらとは独立したものです．
+
 # slide-narrator
 Turn your PDF presentation slides into narrated lecture videos with AI.
 
