@@ -219,7 +219,6 @@ class SlideNarratorApp:
         self.edit_page: int | None = None
         self.log = ''
         self.processing = False
-        self.dark = None
 
         # プロセスおよび非同期キャンセルの追跡
         self.current_process: asyncio.subprocess.Process | None = None
@@ -228,7 +227,7 @@ class SlideNarratorApp:
 
         self.uploader = None
         self.active_count_label = None
-        self.log_area = None
+        self.history_log_widget = None
         self.tabs = None
         self.tab_final_video = None
         self.gallery = None
@@ -300,7 +299,6 @@ class SlideNarratorApp:
             self.active_count_label.text = f'対象スライド: {len(self.active_pages)} / {total} スライド'
 
     def toggle_slide_active(self, page_num: int, active: bool) -> None:
-        """スライドデッキ上でチェックボックスを切り替えた時のハンドラ．"""
         cur = set(self.active_pages)
         if active:
             cur.add(page_num)
@@ -349,12 +347,12 @@ class SlideNarratorApp:
 
     # ---- pipeline / process control -----------------------------------
 
-    def open_processing_dialog(self, initial_title: str) -> tuple[ui.dialog, Callable[[str, float | None, str | None], None]]:
+    def open_processing_dialog(self, initial_title: str) -> tuple[ui.dialog, Callable[[str, float | None, str | None], None], Callable[[str], None]]:
         dialog = ui.dialog()
         dialog.props('persistent')
         self.cancellation_requested = False
 
-        with dialog, ui.card().classes('items-center p-6 gap-3 min-w-[460px]'):
+        with dialog, ui.card().classes('items-center p-6 gap-3 min-w-[560px] max-w-[720px]'):
             ui.spinner(size='lg')
             title_label = ui.label(initial_title).classes('text-base font-bold text-center text-zinc-100')
             status_label = ui.label('準備中…').classes('text-sm text-zinc-400 text-center')
@@ -362,6 +360,10 @@ class SlideNarratorApp:
             with ui.row().classes('w-full items-center gap-2'):
                 progress_bar = ui.linear_progress(value=0.0, show_value=False).props('rounded size=14px').classes('grow')
                 percent_label = ui.label('0%').classes('text-xs font-mono font-bold w-12 text-right text-zinc-300')
+
+            # 処理中のダイアログ内リアルタイム・スクロール可能ログ
+            with ui.expansion('詳細ログを表示', icon='terminal').classes('w-full border border-zinc-700 rounded-lg text-xs mt-1'):
+                dialog_log = ui.log(max_lines=300).classes('w-full h-44 font-mono text-xs bg-zinc-900 text-zinc-300 p-2')
 
             with ui.row().classes('w-full justify-center pt-2'):
                 ui.button('🛑 処理を中断', on_click=self.request_cancel, color='negative').props('outline')
@@ -381,7 +383,7 @@ class SlideNarratorApp:
                 percent = int(round(clamped * 100))
                 percent_label.text = f'{percent}%'
 
-        return dialog, update_status
+        return dialog, update_status, dialog_log.push
 
     async def request_cancel(self) -> None:
         """実行中のプロセスおよびタスクを中断します．"""
@@ -431,7 +433,7 @@ class SlideNarratorApp:
             return
 
         self.save_project_settings()
-        dialog, update_status = self.open_processing_dialog(initial_title)
+        dialog, update_status, push_log = self.open_processing_dialog(initial_title)
         self.set_processing(True)
 
         total_slides = len(self.active_pages) or 1
@@ -465,9 +467,9 @@ class SlideNarratorApp:
                     break
                 line = line_bytes.decode('utf-8', errors='replace').rstrip()
                 full_logs.append(line)
-
-                if self.log_area:
-                    self.log_area.value = '\n'.join(full_logs[-100:])
+                push_log(line)
+                if self.history_log_widget:
+                    self.history_log_widget.push(line)
 
                 # ① ナレーション生成フェーズ
                 if '[LLM] ナレーション生成:' in line:
@@ -535,8 +537,6 @@ class SlideNarratorApp:
 
             rc = await proc.wait()
             self.log = '\n'.join(full_logs)
-            if self.log_area:
-                self.log_area.value = self.log
 
             if self.cancellation_requested:
                 ui.notify('処理を中断しました．完了したスライドは保存されています．', type='warning')
@@ -545,7 +545,7 @@ class SlideNarratorApp:
                 await asyncio.sleep(0.5)
                 ui.notify('パイプライン処理が完了しました．', type='positive')
             else:
-                ui.notify(f'処理が終了コード {rc} で終了しました．ログを確認してください．', type='negative')
+                ui.notify(f'処理が終了コード {rc} で終了しました．ログタブを確認してください．', type='negative')
 
             await self.refresh_all()
 
@@ -556,8 +556,8 @@ class SlideNarratorApp:
             ui.notify('処理がキャンセルされました．', type='warning')
         except Exception as exc:
             self.log = str(exc)
-            if self.log_area:
-                self.log_area.value = self.log
+            if self.history_log_widget:
+                self.history_log_widget.push(str(exc))
             ui.notify(f'処理に失敗しました: {exc}', type='negative')
         finally:
             self.current_process = None
@@ -597,11 +597,12 @@ class SlideNarratorApp:
         if self.processing:
             ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
             return
-        dialog, update_status = self.open_processing_dialog(f'スライド {page} のナレーションをLLMで再作成中…')
+        dialog, update_status, push_log = self.open_processing_dialog(f'スライド {page} のナレーションをLLMで再作成中…')
         self.set_processing(True)
         self.current_task = asyncio.current_task()
         try:
             update_status('全体概要と前後文脈をロード中…', 0.2)
+            push_log(f'[REGEN] スライド {page} ナレーション再生成開始')
             await asyncio.sleep(0.01)
             cfg = self.cfg
             client = await run.io_bound(make_client, cfg['llm'])
@@ -629,6 +630,7 @@ class SlideNarratorApp:
             prev_explanation = prev_exp_path.read_text(encoding='utf-8').strip() if prev_exp_path and prev_exp_path.exists() else ''
 
             update_status(f'LLMでスライド {page} の解説文を推論中…', 0.7)
+            push_log(f'[REGEN] LLM推論中...')
             await asyncio.sleep(0.01)
             new_narration = await run.io_bound(
                 make_explanation,
@@ -659,6 +661,7 @@ class SlideNarratorApp:
                 cleanup_downstream_media(self.pdf, page, include_alignment=True)
                 text_area.value = new_narration.strip()
                 update_status('完了しました！', 1.0)
+                push_log(f'[REGEN] 完了: 新しいナレーションを保存しました')
                 await asyncio.sleep(0.3)
                 ui.notify('ナレーションを再生成しました（古い字幕・音声・動画を初期化しました）．', type='positive')
                 await self.refresh_editor()
@@ -683,11 +686,12 @@ class SlideNarratorApp:
         if self.processing:
             ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
             return
-        dialog, update_status = self.open_processing_dialog('文分割・字幕翻訳・ポインタを再解析中…')
+        dialog, update_status, push_log = self.open_processing_dialog('文分割・字幕翻訳・ポインタを再解析中…')
         self.set_processing(True)
         self.current_task = asyncio.current_task()
         try:
             update_status(f'スライド {page} の要素抽出と対訳・視線誘導を再計算中…', 0.5)
+            push_log(f'[ALIGN] スライド {page} の要素抽出と視線誘導を再計算中...')
             await asyncio.sleep(0.01)
             client = await run.io_bound(make_client, self.cfg['llm'])
             dpi = int(self.cfg.get('pdf', {}).get('dpi', 150))
@@ -706,6 +710,7 @@ class SlideNarratorApp:
 
                 cleanup_downstream_media(self.pdf, page, include_alignment=False)
                 update_status('完了しました！', 1.0)
+                push_log(f'[ALIGN] 完了: 字幕・ポインタアライメントを保存しました')
                 await asyncio.sleep(0.3)
                 ui.notify('字幕とポインタを再生成しました（古い音声・動画をリセットしました）．', type='positive')
                 await self.refresh_editor()
@@ -1025,14 +1030,14 @@ class SlideNarratorApp:
 
     def build(self) -> None:
         ui.page_title('Slide Narrator')
-        self.dark = ui.dark_mode(True)
+        # ダークテーマに固定
+        ui.dark_mode().enable()
         ui.colors(primary='#3b82f6')
 
         with ui.header().classes('items-center w-full px-4 bg-slate-900 border-b border-slate-800'):
             ui.label('🎓 Slide Narrator').classes('text-h5 text-white')
             ui.space()
             ui.label('TAKAGO_LAB. 2026').classes('text-subtitle2 font-mono tracking-wider text-slate-300 mr-2')
-            ui.button(icon='dark_mode', on_click=self.dark.toggle).props('flat round dense color=white').tooltip('ライト／ダークテーマ切替')
 
         with ui.left_drawer(value=True).props('width=320').classes('p-4'):
             ui.label('プロジェクト設定').classes('text-h5')
@@ -1078,7 +1083,6 @@ class SlideNarratorApp:
                 ui.button('④ 動画を生成', on_click=lambda: self.pipeline('video', '④ 動画を生成中…')).classes('w-full'),
             ]
             ui.separator()
-            self.log_area = ui.textarea('処理ログ').props('readonly').classes('w-full').style('min-height: 180px')
             ui.label('TAKAGO LAB., KIT, Japan.').classes('text-caption')
             ui.link('GitHub: takago/slide-narrator', 'https://github.com/takago/slide-narrator', new_tab=True)
 
@@ -1090,6 +1094,7 @@ class SlideNarratorApp:
                 tab_slide_videos = ui.tab('🎞 各スライド単体ビデオ一覧')
                 self.tab_final_video = ui.tab('🎬 完成ビデオ')
                 tab_settings = ui.tab('⚙ 設定')
+                tab_logs = ui.tab('📜 ログ')
 
             with ui.tab_panels(tabs, value=tab_gallery).classes('w-full'):
                 with ui.tab_panel(tab_gallery):
@@ -1105,6 +1110,14 @@ class SlideNarratorApp:
                     self.final_video_container = ui.column().classes('w-full')
                 with ui.tab_panel(tab_settings):
                     self.settings_container = ui.column().classes('w-full')
+                with ui.tab_panel(tab_logs):
+                    with ui.row().classes('w-full items-center justify-between pb-2'):
+                        ui.label('📜 実行ログ履歴').classes('text-h5')
+                        ui.button('ログをクリア', on_click=lambda: self.history_log_widget.clear() if self.history_log_widget else None).props('dense outline size=sm color=negative')
+                    self.history_log_widget = ui.log(max_lines=2000).classes('w-full h-[650px] font-mono text-xs bg-zinc-900 border border-zinc-700 rounded-lg p-3 text-zinc-300')
+                    if self.log:
+                        for line in self.log.splitlines():
+                            self.history_log_widget.push(line)
 
         self.refresh_settings()
         self.recalculate_pages()
