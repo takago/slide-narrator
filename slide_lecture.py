@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -149,6 +150,22 @@ Return ONLY a JSON array of translated strings matching the order and length of 
 """
 
 
+# =====================================================================
+# ファイルシステム／アトミック書き出し用ヘルパー
+# =====================================================================
+
+def atomic_write_text(target: Path, text: str, encoding: str = "utf-8") -> None:
+    """一時ファイルを経由してアトミックにテキストを書き出します．"""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temp_target = target.with_name(f".{target.stem}.tmp{target.suffix}")
+    try:
+        temp_target.write_text(text, encoding=encoding)
+        temp_target.replace(target)
+    finally:
+        if temp_target.exists():
+            temp_target.unlink()
+
+
 def run(cmd: list[str]) -> None:
     print("$", " ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -173,10 +190,10 @@ def detect_best_video_encoder() -> tuple[str, list[str]]:
     except Exception:
         return "libx264", ["-preset", "ultrafast"]
 
-    # 1. NVIDIA NVENC
+    # 1. NVIDIA NVENC (NVENCの最小対応サイズを満たすため128x128でテスト)
     if "h264_nvenc" in encoders:
         test_cmd = [
-            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=128x128:d=0.1",
             "-c:v", "h264_nvenc", "-f", "null", "-"
         ]
         if subprocess.run(test_cmd).returncode == 0:
@@ -186,7 +203,7 @@ def detect_best_video_encoder() -> tuple[str, list[str]]:
     # 2. Apple Silicon / macOS VideoToolbox
     if "h264_videotoolbox" in encoders:
         test_cmd = [
-            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=128x128:d=0.1",
             "-c:v", "h264_videotoolbox", "-f", "null", "-"
         ]
         if subprocess.run(test_cmd).returncode == 0:
@@ -196,7 +213,7 @@ def detect_best_video_encoder() -> tuple[str, list[str]]:
     # 3. Intel QSV
     if "h264_qsv" in encoders:
         test_cmd = [
-            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=64x64:d=0.1",
+            "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=128x128:d=0.1",
             "-c:v", "h264_qsv", "-f", "null", "-"
         ]
         if subprocess.run(test_cmd).returncode == 0:
@@ -226,7 +243,7 @@ def load_project_json(project_dir: Path) -> dict:
 def save_project_json(project_dir: Path, data: dict) -> None:
     project_dir.mkdir(parents=True, exist_ok=True)
     p = project_dir / "project.json"
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_text(p, json.dumps(data, ensure_ascii=False, indent=2))
 
 
 def make_client(cfg: dict) -> OpenAI:
@@ -297,8 +314,14 @@ def pdf_to_images(pdf: Path, out_dir: Path, dpi: int, force: bool) -> list[Path]
         result.append(out)
         if out.exists() and not force:
             continue
-        page.get_pixmap(matrix=matrix, alpha=False).save(out)
-        print(f"[PDF] {out}")
+        temp_out = out.with_name(f".{out.stem}.tmp.png")
+        try:
+            page.get_pixmap(matrix=matrix, alpha=False).save(temp_out)
+            temp_out.replace(out)
+            print(f"[PDF] {out}")
+        finally:
+            if temp_out.exists():
+                temp_out.unlink()
 
     return result
 
@@ -583,7 +606,7 @@ def create_full_srt(
                 sub_idx += 1
                 chunk_start = chunk_end
 
-    out_srt_file.write_text("\n".join(srt_lines) + "\n", encoding="utf-8")
+    atomic_write_text(out_srt_file, "\n".join(srt_lines) + "\n")
 
 
 def create_laser_dot_image(out_path: Path, radius: int = 14) -> Path:
@@ -591,6 +614,7 @@ def create_laser_dot_image(out_path: Path, radius: int = 14) -> Path:
         return out_path
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = out_path.with_name(f".{out_path.stem}.tmp.png")
     size = radius * 2
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
@@ -604,7 +628,12 @@ def create_laser_dot_image(out_path: Path, radius: int = 14) -> Path:
             color = (255, 30, 30, alpha)
         draw.ellipse([radius - r, radius - r, radius + r, radius + r], fill=color)
 
-    img.save(out_path, format="PNG")
+    try:
+        img.save(temp_path, format="PNG")
+        temp_path.replace(out_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
     return out_path
 
 
@@ -947,7 +976,7 @@ def generate_explanations(
         overview = overview_path.read_text(encoding="utf-8")
     else:
         overview = build_course_overview(client, cfg, page_texts, mode=mode, lang=lang)
-        overview_path.write_text(overview + "\n", encoding="utf-8")
+        atomic_write_text(overview_path, overview + "\n")
 
     result = []
     previous_explanation = ""
@@ -990,7 +1019,7 @@ def generate_explanations(
             mode=mode,
             lang=lang,
         )
-        out.write_text(text + "\n", encoding="utf-8")
+        atomic_write_text(out, text + "\n")
         previous_explanation = text
 
     return result
@@ -1028,7 +1057,7 @@ def generate_alignments(
         print(f"[ALIGN] 字幕＆ポインタ解析: page {i}/{len(images)}")
         raw_text = text_file.read_text(encoding="utf-8").strip()
         align_data = generate_single_alignment(client, cfg, pdf, i, image, raw_text, dpi, lang)
-        align_out.write_text(json.dumps(align_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_text(align_out, json.dumps(align_data, ensure_ascii=False, indent=2))
 
 
 def generate_tts(
@@ -1043,19 +1072,27 @@ def generate_tts(
         print(f"[TTS] reuse {out_path}")
         return
 
-    client = make_client(tts_cfg)
-    raw_text = text_path.read_text(encoding="utf-8").strip()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_out = out_path.with_name(f".{out_path.stem}.tmp.mp3")
 
-    tts_text = apply_tts_filter(raw_text, filter_config_path) if lang == "ja" else raw_text
+    try:
+        client = make_client(tts_cfg)
+        raw_text = text_path.read_text(encoding="utf-8").strip()
 
-    response = client.audio.speech.create(
-        model=tts_cfg["model"],
-        voice=tts_cfg["voice"],
-        input=tts_text,
-        response_format=tts_cfg.get("response_format", "mp3"),
-    )
-    response.write_to_file(out_path)
-    print(f"[TTS:{lang}] {out_path}")
+        tts_text = apply_tts_filter(raw_text, filter_config_path) if lang == "ja" else raw_text
+
+        response = client.audio.speech.create(
+            model=tts_cfg["model"],
+            voice=tts_cfg["voice"],
+            input=tts_text,
+            response_format=tts_cfg.get("response_format", "mp3"),
+        )
+        response.write_to_file(temp_out)
+        temp_out.replace(out_path)
+        print(f"[TTS:{lang}] {out_path}")
+    finally:
+        if temp_out.exists():
+            temp_out.unlink()
 
 
 def generate_page_video(
@@ -1071,7 +1108,10 @@ def generate_page_video(
         print(f"[VIDEO] reuse {out}")
         return
 
-    # 利用可能な最速エンコーダを自動取得
+    out.parent.mkdir(parents=True, exist_ok=True)
+    temp_out = out.with_name(f".{out.stem}.tmp.mp4")
+    filter_script = out.parent / f".{out.stem}_filter.txt"
+
     vcodec, encoder_opts = detect_best_video_encoder()
 
     crf = str(cfg.get("crf", 20))
@@ -1079,7 +1119,6 @@ def generate_page_video(
     audio_codec = str(cfg.get("audio_codec", "aac"))
     audio_bitrate = str(cfg.get("audio_bitrate", "192k"))
 
-    # 品質/レート制御オプション（エンコーダ別）
     quality_opts = []
     if vcodec == "libx264":
         quality_opts = ["-crf", crf]
@@ -1088,65 +1127,77 @@ def generate_page_video(
     elif vcodec == "h264_qsv":
         quality_opts = ["-global_quality", crf]
 
-    if not schedule:
-        cmd = [
-            "ffmpeg", "-y",
-            "-loop", "1",
-            "-i", str(image),
-            "-i", str(audio),
-            "-map", "0:v:0",
-            "-map", "1:a:0",
-            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-            "-c:v", vcodec,
-            *encoder_opts,
-            *quality_opts,
-            "-r", fps,
-            "-pix_fmt", "yuv420p",
-            "-c:a", audio_codec,
-            "-b:a", audio_bitrate,
-            "-shortest",
-            "-movflags", "+faststart",
-            str(out),
-        ]
-        run(cmd)
-        return
+    try:
+        if not schedule:
+            cmd = [
+                "ffmpeg", "-y",
+                "-loop", "1",
+                "-i", str(image),
+                "-i", str(audio),
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                "-c:v", vcodec,
+                *encoder_opts,
+                *quality_opts,
+                "-r", fps,
+                "-pix_fmt", "yuv420p",
+                "-c:a", audio_codec,
+                "-b:a", audio_bitrate,
+                "-shortest",
+                "-movflags", "+faststart",
+                "-f", "mp4",
+                str(temp_out),
+            ]
+            run(cmd)
+        else:
+            expr_x_parts = [
+                f"between(t,{s['start']},{s['end']})*({s['x']}+2*sin(4*PI*t))"
+                for s in schedule
+            ]
+            expr_y_parts = [
+                f"between(t,{s['start']},{s['end']})*({s['y']}+2*cos(4*PI*t))"
+                for s in schedule
+            ]
+            expr_x = "+".join(expr_x_parts) if expr_x_parts else "-100"
+            expr_y = "+".join(expr_y_parts) if expr_y_parts else "-100"
 
-    expr_x_parts = [
-        f"between(t,{s['start']},{s['end']})*({s['x']}+2*sin(4*PI*t))"
-        for s in schedule
-    ]
-    expr_y_parts = [
-        f"between(t,{s['start']},{s['end']})*({s['y']}+2*cos(4*PI*t))"
-        for s in schedule
-    ]
-    expr_x = "+".join(expr_x_parts) if expr_x_parts else "-100"
-    expr_y = "+".join(expr_y_parts) if expr_y_parts else "-100"
+            filter_complex = (
+                f"[0:v]scale=trunc(iw/2)*2:trunc(ih/2)*2[bg];\n"
+                f"[bg][1:v]overlay=x='{expr_x}':y='{expr_y}':eval=frame[v]\n"
+            )
 
-    filter_complex = (
-        f"[0:v]scale=trunc(iw/2)*2:trunc(ih/2)*2[bg];"
-        f"[bg][1:v]overlay=x='{expr_x}':y='{expr_y}':eval=frame[v]"
-    )
+            filter_script.write_text(filter_complex, encoding="utf-8")
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-loop", "1", "-i", str(image),
-        "-loop", "1", "-i", str(laser_img),
-        "-i", str(audio),
-        "-filter_complex", filter_complex,
-        "-map", "[v]",
-        "-map", "2:a:0",
-        "-c:v", vcodec,
-        *encoder_opts,
-        *quality_opts,
-        "-r", fps,
-        "-pix_fmt", "yuv420p",
-        "-c:a", audio_codec,
-        "-b:a", audio_bitrate,
-        "-shortest",
-        "-movflags", "+faststart",
-        str(out),
-    ]
-    run(cmd)
+            cmd = [
+                "ffmpeg", "-y",
+                "-loop", "1", "-i", str(image),
+                "-loop", "1", "-i", str(laser_img),
+                "-i", str(audio),
+                "-filter_complex_script", str(filter_script),
+                "-map", "[v]",
+                "-map", "2:a:0",
+                "-c:v", vcodec,
+                *encoder_opts,
+                *quality_opts,
+                "-r", fps,
+                "-pix_fmt", "yuv420p",
+                "-c:a", audio_codec,
+                "-b:a", audio_bitrate,
+                "-shortest",
+                "-movflags", "+faststart",
+                "-f", "mp4",
+                str(temp_out),
+            ]
+            run(cmd)
+
+        temp_out.replace(out)
+        print(f"[VIDEO] {out}")
+    finally:
+        if filter_script.exists():
+            filter_script.unlink()
+        if temp_out.exists():
+            temp_out.unlink()
 
 
 def create_chapter_metadata(videos: list[Path], slide_indices: list[int], out_metadata_file: Path) -> None:
@@ -1166,7 +1217,7 @@ def create_chapter_metadata(videos: list[Path], slide_indices: list[int], out_me
 
         current_time_ms = end_time_ms
 
-    out_metadata_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    atomic_write_text(out_metadata_file, "\n".join(lines) + "\n")
 
 
 def concat_videos(
@@ -1181,6 +1232,9 @@ def concat_videos(
     if out.exists() and not force:
         print(f"[CONCAT] reuse {out}")
         return
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    temp_out = out.with_name(f".{out.stem}.tmp.mp4")
 
     list_file = out.parent / "concat.txt"
     with list_file.open("w", encoding="utf-8") as f:
@@ -1228,9 +1282,16 @@ def concat_videos(
 
     cmd.extend([
         "-movflags", "+faststart",
-        str(out),
+        "-f", "mp4",
+        str(temp_out),
     ])
-    run(cmd)
+
+    try:
+        run(cmd)
+        temp_out.replace(out)
+    finally:
+        if temp_out.exists():
+            temp_out.unlink()
 
 
 def main() -> int:
@@ -1262,7 +1323,6 @@ def main() -> int:
     root = args.output or args.pdf.with_name(args.pdf.stem + "_lecture")
     filter_config_path = Path("tts_filter.yaml")
 
-    # プロジェクト固有設定 (project.json) の統合読み出し
     proj_cfg = load_project_json(root)
     mode = args.mode or proj_cfg.get("mode") or cfg.get("mode", "lecture")
     lang = args.lang or proj_cfg.get("language") or cfg.get("language", "ja")
@@ -1282,7 +1342,6 @@ def main() -> int:
     audio = root / "audio"
     video = root / "video"
 
-    # --force 指定時の下流段階的カスケード削除
     if args.force:
         print(f"[FORCE CLEANUP] 開始ステージ '{args.start}' に応じて下流ファイルを削除・初期化します．")
         for f in root.glob(f"{args.pdf.stem}*"):
@@ -1376,10 +1435,11 @@ def main() -> int:
     tts_all = cfg.get("tts", {})
     tts_cfg = tts_all.get(lang, tts_all)
 
-    for page_num in sorted_active_pages:
+    for k, page_num in enumerate(sorted_active_pages, 1):
         text_file = explanations / f"{page_num:03d}.txt"
         mp3 = audio / f"{page_num:03d}.mp3"
         if text_file.exists():
+            print(f"[TTS] 音声合成中: page {page_num} ({k}/{len(sorted_active_pages)})")
             generate_tts(text_file, mp3, tts_cfg, filter_config_path, args.force, lang=lang)
 
     if args.start == "tts":
@@ -1395,7 +1455,7 @@ def main() -> int:
     all_page_subtitles = []
     accumulated_offset = 0.0
 
-    for page_num in sorted_active_pages:
+    for k, page_num in enumerate(sorted_active_pages, 1):
         image = pages / f"{page_num:03d}.png"
         mp3_file = audio / f"{page_num:03d}.mp3"
         text_file = explanations / f"{page_num:03d}.txt"
@@ -1405,6 +1465,8 @@ def main() -> int:
         if not mp3_file.exists() or not image.exists():
             continue
 
+        print(f"[VIDEO] スライド動画生成中: page {page_num} ({k}/{len(sorted_active_pages)})")
+
         schedule = []
         duration = get_audio_duration(mp3_file)
 
@@ -1413,7 +1475,6 @@ def main() -> int:
             blocks = align_data.get("blocks", [])
             alignments = align_data.get("alignments", [])
 
-            # 重複していたTTSフィルタLLM呼び出しを排除し、直接元の文を割り当て
             for item in alignments:
                 item["tts_sentence"] = item["sentence"]
 
