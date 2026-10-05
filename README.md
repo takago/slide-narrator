@@ -1,9 +1,9 @@
+# slide-narrator
+Turn your PDF presentation slides into narrated lecture videos with AI.
+
 > **Note:** I chose the name `slide-narrator` when I created this repository, and only later discovered that several unrelated projects and packages use the same name. This project is independent of those projects.
 >
 > **注意:** 本リポジトリ作成後に，同じ `slide-narrator` という名前を使用している無関係のプロジェクトやパッケージがいくつか存在することに気付きました．本プロジェクトはそれらとは独立したものです．
-
-# slide-narrator
-Turn your PDF presentation slides into narrated lecture videos with AI.
 
 講義や研究発表用のPDF形式スライドから音声付きスライドショー動画（日本語・英語字幕対応）を自動的に生成するシステムです。
  - CLI版とWebUI版(niceguiを利用）
