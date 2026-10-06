@@ -1,0 +1,20 @@
+[Unit]
+Description=slide-narrator
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 適宜変更
+WorkingDirectory=%h/slide-narrator
+ExecStart=%h/slide-narrator/.venv/bin/python app.py 
+
+Restart=always
+RestartSec=3
+
+# 適宜変更
+Environment=REQUESTQ_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+
+[Install]
+WantedBy=default.target
