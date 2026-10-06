@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -366,26 +367,73 @@ class SlideNarratorApp:
 
     async def load_pdf(self, e) -> None:
         filename = Path(e.file.name).name
-        pdf = UPLOAD_DIR / filename
-        if not pdf.exists() or pdf.stat().st_size != e.file.size():
-            await e.file.save(pdf)
+        target_pdf = UPLOAD_DIR / filename
+        target_paths = ProjectPaths(target_pdf)
 
-        self.pdf = pdf
-        self.paths = ProjectPaths(pdf)
-        self.proj_cfg = load_project_json(self.paths.root)
-        self.mode_code = self.proj_cfg.get('mode') or self.cfg.get('mode', 'lecture')
-        self.lang_code = self.proj_cfg.get('language') or self.cfg.get('language', 'ja')
+        # 一旦テンポラリファイルとして保存
+        temp_pdf = UPLOAD_DIR / f".upload_{int(time.time())}_{filename}"
+        await e.file.save(temp_pdf)
 
-        self.images = await run.io_bound(
-            ensure_page_images, self.paths, int(self.cfg.get('pdf', {}).get('dpi', 120))
-        )
+        # 既存のプロジェクトフォルダまたはPDFファイルが存在するか判定
+        has_existing_project = target_paths.root.exists() or target_pdf.exists()
 
-        saved_pages_spec = self.proj_cfg.get('pages', '')
-        self.apply_pages_spec(saved_pages_spec, save_and_refresh=False)
+        async def finalize_loading(delete_existing: bool) -> None:
+            if delete_existing:
+                # 既存の出力フォルダ一式を削除
+                if target_paths.root.exists():
+                    shutil.rmtree(target_paths.root, ignore_errors=True)
+                if target_pdf.exists():
+                    target_pdf.unlink()
+                ui.notify(f'既存のプロジェクトデータを削除しました: {target_paths.root.name}', type='info')
 
-        self.refresh_project_widgets()
-        await self.refresh_all()
-        ui.notify(f'プレゼンテーションを読み込みました: {pdf.name}', type='positive')
+            # アップロードされたファイルを正式な場所に配置
+            temp_pdf.replace(target_pdf)
+
+            self.pdf = target_pdf
+            self.paths = target_paths
+            self.proj_cfg = load_project_json(self.paths.root)
+            self.mode_code = self.proj_cfg.get('mode') or self.cfg.get('mode', 'lecture')
+            self.lang_code = self.proj_cfg.get('language') or self.cfg.get('language', 'ja')
+
+            self.images = await run.io_bound(
+                ensure_page_images, self.paths, int(self.cfg.get('pdf', {}).get('dpi', 120))
+            )
+
+            saved_pages_spec = self.proj_cfg.get('pages', '')
+            self.apply_pages_spec(saved_pages_spec, save_and_refresh=False)
+
+            self.refresh_project_widgets()
+            await self.refresh_all()
+            ui.notify(f'プレゼンテーションを読み込みました: {target_pdf.name}', type='positive')
+
+        if has_existing_project:
+            # 削除確認ダイアログを表示
+            with ui.dialog() as dialog, ui.card().classes('p-5 gap-4 max-w-md'):
+                dialog.props('persistent')
+                with ui.row().classes('items-center gap-2 text-warning'):
+                    ui.icon('warning', size='md').classes('text-amber-500')
+                    ui.label('既存プロジェクトが見つかりました').classes('text-base font-bold text-zinc-100')
+
+                ui.label(
+                    f'「{filename}」に対応する既存フォルダ（{target_paths.root.name}）が既に存在します。'
+                    'フォルダ一式（生成済みのナレーション原稿・音声・動画など）をすべて削除して新しくやり直しますか？'
+                ).classes('text-sm text-zinc-300 leading-relaxed')
+
+                with ui.row().classes('w-full justify-end gap-3 pt-2'):
+                    async def on_keep():
+                        dialog.close()
+                        await finalize_loading(delete_existing=False)
+
+                    async def on_delete():
+                        dialog.close()
+                        await finalize_loading(delete_existing=True)
+
+                    ui.button('既存データを引き継ぐ', on_click=on_keep).props('outline color=grey')
+                    ui.button('一式を削除して初期化', on_click=on_delete).props('color=negative')
+
+            dialog.open()
+        else:
+            await finalize_loading(delete_existing=False)
 
     def refresh_project_widgets(self) -> None:
         if not self.pdf:
