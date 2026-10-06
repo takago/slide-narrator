@@ -1928,5 +1928,5 @@ def login_page():
         ui.button('ログイン', on_click=try_login).props('color=primary').classes('w-full mt-2')
 
 
-ui.run(title='Slide Narrator', reload=False, storage_secret='slide-narrator-session-secret-key-change-in-prod')
-# ui.run(title='Slide Narrator', reload=False, show=False, port=17171, host='0.0.0.0', storage_secret='slide-narrator-session-secret-key-change-in-prod')
+# ui.run(title='Slide Narrator', reload=False, storage_secret='slide-narrator-session-secret-key-change-in-prod')
+ui.run(title='Slide Narrator', reload=False, show=False, port=17171, host='0.0.0.0', storage_secret='slide-narrator-session-secret-key-change-in-prod')
