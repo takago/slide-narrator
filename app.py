@@ -409,21 +409,21 @@ class SlideNarratorApp:
             slide_preview_row = ui.row().classes('w-full items-end justify-center gap-3 py-2')
             with slide_preview_row:
                 with ui.column().classes('items-center w-28 opacity-45'):
-                    prev_img_box = ui.column().classes('w-28 h-18 items-center justify-center overflow-hidden')
+                    prev_img_box = ui.column().classes('w-28 aspect-video items-center justify-center')
                     with prev_img_box:
-                        prev_image = ui.image('').classes('w-full rounded').style('display: none')
+                        prev_image = ui.image('').props('fit=contain').classes('w-full h-full rounded').style('display: none')
                         prev_placeholder = ui.label('-').classes('text-xs text-zinc-500')
 
-                with ui.column().classes('items-center w-48 scale-105 transition-all'):
-                    curr_img_box = ui.column().classes('w-48 h-30 items-center justify-center overflow-hidden')
+                with ui.column().classes('items-center w-52 scale-105 transition-all'):
+                    curr_img_box = ui.column().classes('w-52 aspect-video items-center justify-center')
                     with curr_img_box:
-                        curr_image = ui.image('').classes('w-full rounded').style('display: none')
+                        curr_image = ui.image('').props('fit=contain').classes('w-full h-full rounded').style('display: none')
                         curr_placeholder = ui.label('スライド待機中').classes('text-xs text-zinc-400')
 
                 with ui.column().classes('items-center w-28 opacity-45'):
-                    next_img_box = ui.column().classes('w-28 h-18 items-center justify-center overflow-hidden')
+                    next_img_box = ui.column().classes('w-28 aspect-video items-center justify-center')
                     with next_img_box:
-                        next_image = ui.image('').classes('w-full rounded').style('display: none')
+                        next_image = ui.image('').props('fit=contain').classes('w-full h-full rounded').style('display: none')
                         next_placeholder = ui.label('-').classes('text-xs text-zinc-500')
 
             with ui.expansion('詳細ログを表示', icon='terminal').classes('w-full border border-zinc-700 rounded-lg text-xs mt-1'):
@@ -537,7 +537,7 @@ class SlideNarratorApp:
         phase_titles = {
             'explain': '① ナレーション原稿を作成中…',
             'align': '② 字幕・ポインタを解析中…',
-            'tts': f'③ 音声を合成中 ({self.lang_code})…',
+            'tts': f'③ 音声を合成中…',
             'video': '④ スライド動画をレンダリング中…',
             'concat': '④ 完成動画を結合・生成中…',
         }
@@ -1392,10 +1392,10 @@ class SlideNarratorApp:
             self.force_checkbox.tooltip('チェックを入れると、生成済みのナレーション・音声・動画ファイルをスキップせずにすべて作り直します．')
             self.force_checkbox.on_value_change(lambda e: setattr(self, 'force_run', bool(e.value)))
             self.pipeline_buttons = [
-                ui.button('① ナレーション原稿を一括生成', on_click=lambda: self.pipeline('explain', '① ナレーション原稿を作成中…')).classes('w-full'),
-                ui.button('② 字幕翻訳＆ポインタを一括解析', on_click=lambda: self.pipeline('align', '② 字幕・ポインタを解析中…')).classes('w-full'),
-                ui.button('③ TTS音声を生成', on_click=lambda: self.pipeline('tts', f'③ 音声を合成中 ({self.lang_code})…')).classes('w-full'),
-                ui.button('④ 動画を生成', on_click=lambda: self.pipeline('video', '④ 動画を生成中…')).classes('w-full'),
+                ui.button('① ナレーション原稿の生成', on_click=lambda: self.pipeline('explain', '① ナレーション原稿を作成中…')).classes('w-full'),
+                ui.button('② 翻訳，字幕生成，ポインタの配置', on_click=lambda: self.pipeline('align', '② 翻訳と字幕，ポインタ配置を決定中…')).classes('w-full'),
+                ui.button('③ 音声の合成', on_click=lambda: self.pipeline('tts', f'③ ナレーション音声を合成中…')).classes('w-full'),
+                ui.button('④ 動画の生成', on_click=lambda: self.pipeline('video', '④ 動画を生成中…')).classes('w-full'),
             ]
             ui.separator()
             ui.label('🎬 完成ビデオ').classes('text-subtitle1 font-bold text-zinc-200')
