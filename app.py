@@ -7,7 +7,6 @@ import os
 import signal
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,16 +17,11 @@ from nicegui import app, run, ui
 from PIL import Image, ImageDraw
 
 from slide_lecture import (
-    build_course_overview,
-    extract_page_text,
     generate_single_alignment,
     generate_single_explanation,
     generate_single_tts,
-    generate_single_page_video,
-    generate_tts,
     load_project_json,
     make_client,
-    make_explanation,
     parse_page_ranges,
     save_project_json,
 )
@@ -107,29 +101,32 @@ class ProjectPaths:
     def final_en_srt(self) -> Path:
         return self.root / f'{self.pdf.stem}_en.srt'
 
+    @staticmethod
+    def _unlink(path: Path) -> None:
+        if path.exists():
+            path.unlink()
+
     def cleanup_downstream(self, page: int | None = None, include_alignment: bool = False) -> None:
-        """下流のメディアファイル（動画・音声・字幕）を無効化・削除します"""
-        for f in [self.final_video, self.final_ja_srt, self.final_en_srt]:
-            if f.exists():
-                f.unlink()
+        """下流のメディアファイル（動画・音声・字幕）を削除します．"""
+        for path in (self.final_video, self.final_ja_srt, self.final_en_srt):
+            self._unlink(path)
 
         if page is not None:
             if include_alignment:
-                f = self.alignment(page)
-                if f.exists():
-                    f.unlink()
-            for f in [self.audio(page), self.video(page)]:
-                if f.exists():
-                    f.unlink()
-        else:
-            if include_alignment and self.explanations_dir.exists():
-                for f in self.explanations_dir.glob('*_align.json'):
-                    f.unlink()
-            for d in [self.audio_dir, self.video_dir]:
-                if d.exists():
-                    for f in d.glob('*'):
-                        if f.is_file():
-                            f.unlink()
+                self._unlink(self.alignment(page))
+            for path in (self.audio(page), self.video(page)):
+                self._unlink(path)
+            return
+
+        if include_alignment and self.explanations_dir.exists():
+            for path in self.explanations_dir.glob('*_align.json'):
+                self._unlink(path)
+
+        for directory in (self.audio_dir, self.video_dir):
+            if directory.exists():
+                for path in directory.iterdir():
+                    if path.is_file():
+                        self._unlink(path)
 
 
 def ensure_page_images(paths: ProjectPaths, dpi: int = 120) -> list[Path]:
@@ -191,11 +188,19 @@ def file_url(path: Path) -> str:
     return '/files/' + path.resolve().relative_to(Path.cwd().resolve()).as_posix()
 
 
-@app.get('/files/{path:path}')
-async def serve_file(path: str):
+def _resolve_file(path: str) -> Path | None:
+    """Resolve a path below the application root, rejecting traversal."""
     root = Path.cwd().resolve()
     target = (root / path).resolve()
     if root not in target.parents and target != root:
+        return None
+    return target
+
+
+@app.get('/files/{path:path}')
+async def serve_file(path: str):
+    target = _resolve_file(path)
+    if target is None:
         return PlainTextResponse('Forbidden', status_code=403)
     if not target.is_file():
         return PlainTextResponse('Not found', status_code=404)
@@ -204,9 +209,8 @@ async def serve_file(path: str):
 
 @app.get('/download/{path:path}')
 async def download_file(path: str):
-    root = Path.cwd().resolve()
-    target = (root / path).resolve()
-    if root not in target.parents and target != root:
+    target = _resolve_file(path)
+    if target is None:
         return PlainTextResponse('Forbidden', status_code=403)
     if not target.is_file():
         return PlainTextResponse('Not found', status_code=404)
@@ -441,31 +445,20 @@ class SlideNarratorApp:
             prev_p = pages_list[idx - 1] if idx > 0 else None
             next_p = pages_list[idx + 1] if idx + 1 < len(pages_list) else None
 
-            if prev_p is not None:
-                p_path = self.paths.page_image(prev_p)
-                if p_path.exists():
-                    prev_image.set_source(file_url(p_path))
-                    prev_image.style('display: block')
-                    prev_placeholder.style('display: none')
-            else:
-                prev_image.style('display: none')
-                prev_placeholder.style('display: block')
+            def set_preview(image_widget, placeholder, page: int | None) -> None:
+                if page is not None:
+                    image_path = self.paths.page_image(page)
+                    if image_path.exists():
+                        image_widget.set_source(file_url(image_path))
+                        image_widget.style('display: block')
+                        placeholder.style('display: none')
+                        return
+                image_widget.style('display: none')
+                placeholder.style('display: block')
 
-            c_path = self.paths.page_image(current_page)
-            if c_path.exists():
-                curr_image.set_source(file_url(c_path))
-                curr_image.style('display: block')
-                curr_placeholder.style('display: none')
-
-            if next_p is not None:
-                n_path = self.paths.page_image(next_p)
-                if n_path.exists():
-                    next_image.set_source(file_url(n_path))
-                    next_image.style('display: block')
-                    next_placeholder.style('display: none')
-            else:
-                next_image.style('display: none')
-                next_placeholder.style('display: block')
+            set_preview(prev_image, prev_placeholder, prev_p)
+            set_preview(curr_image, curr_placeholder, current_page)
+            set_preview(next_image, next_placeholder, next_p)
 
         def update_status(text: str, frac: float | None = None, title: str | None = None, current_page: int | None = None) -> None:
             if title is not None:

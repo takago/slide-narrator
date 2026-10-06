@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import base64
 import json
-import os
 import re
 import shutil
 import subprocess
@@ -1234,13 +1233,11 @@ def generate_page_video(
     audio_codec = str(cfg.get("audio_codec", "aac"))
     audio_bitrate = str(cfg.get("audio_bitrate", "192k"))
 
-    quality_opts = []
-    if vcodec == "libx264":
-        quality_opts = ["-crf", crf]
-    elif vcodec == "h264_nvenc":
-        quality_opts = ["-cq", crf]
-    elif vcodec == "h264_qsv":
-        quality_opts = ["-global_quality", crf]
+    quality_opts = {
+        "libx264": ["-crf", crf],
+        "h264_nvenc": ["-cq", crf],
+        "h264_qsv": ["-global_quality", crf],
+    }.get(vcodec, [])
 
     try:
         if not schedule:
@@ -1409,6 +1406,182 @@ def concat_videos(
             temp_out.unlink()
 
 
+STAGES = ("pdf", "explain", "align", "tts", "video")
+
+
+def _force_cleanup(root: Path, pdf: Path, start: str) -> None:
+    """開始ステージに応じて，そのステージ以降の生成物を初期化します．"""
+    print(f"[FORCE CLEANUP] 開始ステージ '{start}' に応じて下流ファイルを削除・初期化します．")
+
+    for path in root.glob(f"{pdf.stem}*"):
+        if path.is_file():
+            path.unlink()
+
+    start_idx = STAGES.index(start)
+
+    directories = {
+        "pdf": root / "pages",
+        "explain": root / "explanations",
+        "tts": root / "audio",
+        "video": root / "video",
+    }
+
+    for stage, directory in directories.items():
+        if start_idx <= STAGES.index(stage) and directory.exists():
+            shutil.rmtree(directory)
+
+    if start == "align":
+        explanations = root / "explanations"
+        if explanations.exists():
+            for path in explanations.glob("*_align.json"):
+                path.unlink()
+
+
+def _resolve_active_pages(total_pages: int, pages_spec: str, skip_pages_spec: str) -> list[int]:
+    """対象スライドを昇順で返します．"""
+    active_pages = set(range(1, total_pages + 1))
+
+    if pages_spec:
+        active_pages &= parse_page_ranges(pages_spec)
+    if skip_pages_spec:
+        active_pages -= parse_page_ranges(skip_pages_spec)
+
+    return sorted(active_pages)
+
+
+def _run_tts_stage(
+    sorted_active_pages: list[int],
+    explanations: Path,
+    audio: Path,
+    tts_cfg: dict,
+    filter_config_path: Path,
+    force: bool,
+    lang: str,
+) -> None:
+    total = len(sorted_active_pages)
+
+    for index, page_num in enumerate(sorted_active_pages, 1):
+        text_file = explanations / f"{page_num:03d}.txt"
+        mp3 = audio / f"{page_num:03d}.mp3"
+        if not text_file.exists():
+            continue
+
+        emit_progress(
+            "tts",
+            index,
+            total,
+            page=page_num,
+            message=f"スライド {page_num}（{index}/{total}）",
+        )
+        print(f"[TTS] 音声合成中: page {page_num} ({index}/{total})")
+        generate_tts(
+            text_file,
+            mp3,
+            tts_cfg,
+            filter_config_path,
+            force,
+            lang=lang,
+        )
+
+
+def _run_video_stage(
+    pdf: Path,
+    root: Path,
+    pages: Path,
+    explanations: Path,
+    audio: Path,
+    video: Path,
+    sorted_active_pages: list[int],
+    laser_img: Path,
+    video_cfg: dict,
+    force: bool,
+    lang: str,
+) -> None:
+    videos: list[Path] = []
+    video_slide_indices: list[int] = []
+    all_page_subtitles: list[tuple[float, list[dict]]] = []
+    accumulated_offset = 0.0
+    total = len(sorted_active_pages)
+
+    for index, page_num in enumerate(sorted_active_pages, 1):
+        image = pages / f"{page_num:03d}.png"
+        mp3_file = audio / f"{page_num:03d}.mp3"
+        text_file = explanations / f"{page_num:03d}.txt"
+        out = video / f"{page_num:03d}.mp4"
+        align_file = explanations / f"{page_num:03d}_align.json"
+
+        if not mp3_file.exists() or not image.exists():
+            continue
+
+        emit_progress(
+            "video",
+            index,
+            total,
+            page=page_num,
+            message=f"スライド {page_num}（{index}/{total}）",
+        )
+        print(f"[VIDEO] スライド動画生成中: page {page_num} ({index}/{total})")
+
+        duration = get_audio_duration(mp3_file)
+
+        if align_file.exists():
+            align_data = json.loads(align_file.read_text(encoding="utf-8"))
+            blocks = align_data.get("blocks", [])
+            alignments = align_data.get("alignments", [])
+
+            # build_pointer_schedule は tts_sentence があればそれを時間配分に使用する．
+            for item in alignments:
+                item["tts_sentence"] = item["sentence"]
+
+            schedule, page_subtitles = build_pointer_schedule(
+                blocks, alignments, duration
+            )
+        else:
+            text = text_file.read_text(encoding="utf-8").strip() if text_file.exists() else ""
+            page_subtitles = [{
+                "start": 0.0,
+                "end": duration,
+                "sentence": text,
+                "ja_sentence": text if lang == "ja" else "",
+                "en_sentence": text if lang == "en" else "",
+            }]
+            schedule = []
+
+        all_page_subtitles.append((accumulated_offset, page_subtitles))
+        accumulated_offset += duration
+
+        generate_page_video(
+            image,
+            mp3_file,
+            out,
+            schedule,
+            laser_img,
+            video_cfg,
+            force,
+        )
+        videos.append(out)
+        video_slide_indices.append(page_num)
+
+    emit_progress("concat", len(videos), len(videos), message="完成動画を結合・生成中…")
+
+    final_ja_srt = root / f"{pdf.stem}_ja.srt"
+    final_en_srt = root / f"{pdf.stem}_en.srt"
+    create_full_srt(all_page_subtitles, final_ja_srt, lang="ja")
+    create_full_srt(all_page_subtitles, final_en_srt, lang="en")
+
+    final = root / f"{pdf.stem}.mp4"
+    concat_videos(
+        videos,
+        video_slide_indices,
+        final_ja_srt,
+        final_en_srt,
+        final,
+        force,
+        primary_lang=lang,
+    )
+
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="PDFから講義・研究発表動画を自動生成します．"
@@ -1418,7 +1591,7 @@ def main() -> int:
     parser.add_argument(
         "--from",
         dest="start",
-        choices=["pdf", "explain", "align", "tts", "video"],
+        choices=list(STAGES),
         default="pdf",
     )
     parser.add_argument("--force", action="store_true")
@@ -1442,7 +1615,11 @@ def main() -> int:
     mode = args.mode or proj_cfg.get("mode") or cfg.get("mode", "lecture")
     lang = args.lang or proj_cfg.get("language") or cfg.get("language", "ja")
     pages_spec = args.pages if args.pages is not None else proj_cfg.get("pages", "")
-    skip_pages_spec = args.skip_pages if args.skip_pages is not None else proj_cfg.get("skip_pages", "")
+    skip_pages_spec = (
+        args.skip_pages
+        if args.skip_pages is not None
+        else proj_cfg.get("skip_pages", "")
+    )
 
     proj_cfg.update({
         "mode": mode,
@@ -1458,36 +1635,10 @@ def main() -> int:
     video = root / "video"
 
     if args.force:
-        print(f"[FORCE CLEANUP] 開始ステージ '{args.start}' に応じて下流ファイルを削除・初期化します．")
-        for f in root.glob(f"{args.pdf.stem}*"):
-            if f.is_file():
-                f.unlink()
+        _force_cleanup(root, args.pdf, args.start)
 
-        stages = ["pdf", "explain", "align", "tts", "video"]
-        start_idx = stages.index(args.start)
-
-        if start_idx <= stages.index("pdf"):
-            if pages.exists():
-                shutil.rmtree(pages)
-
-        if start_idx <= stages.index("explain"):
-            if explanations.exists():
-                shutil.rmtree(explanations)
-        elif start_idx == stages.index("align"):
-            if explanations.exists():
-                for align_f in explanations.glob("*_align.json"):
-                    align_f.unlink()
-
-        if start_idx <= stages.index("tts"):
-            if audio.exists():
-                shutil.rmtree(audio)
-
-        if start_idx <= stages.index("video"):
-            if video.exists():
-                shutil.rmtree(video)
-
-    for d in [pages, explanations, audio, video]:
-        d.mkdir(parents=True, exist_ok=True)
+    for directory in (pages, explanations, audio, video):
+        directory.mkdir(parents=True, exist_ok=True)
 
     dpi = int(cfg["pdf"].get("dpi", 150))
     images = pdf_to_images(args.pdf, pages, dpi, args.force)
@@ -1497,23 +1648,24 @@ def main() -> int:
         print("次: python slide_lecture.py lecture.pdf --from explain")
         return 0
 
-    total_pages = len(images)
-    active_pages = set(range(1, total_pages + 1))
-
-    if pages_spec:
-        cli_selected = parse_page_ranges(pages_spec)
-        active_pages &= cli_selected
-
-    if skip_pages_spec:
-        cli_skipped = parse_page_ranges(skip_pages_spec)
-        active_pages -= cli_skipped
-
-    sorted_active_pages = sorted(list(active_pages))
-    print(f"対象スライド数: {len(sorted_active_pages)} / {total_pages} ページ: {sorted_active_pages}")
+    sorted_active_pages = _resolve_active_pages(
+        len(images),
+        pages_spec,
+        skip_pages_spec,
+    )
+    print(
+        f"対象スライド数: {len(sorted_active_pages)} / "
+        f"{len(images)} ページ: {sorted_active_pages}"
+    )
 
     if not sorted_active_pages:
-        print("対象となるスライドが1枚もありません．指定を確認してください．", file=sys.stderr)
+        print(
+            "対象となるスライドが1枚もありません．指定を確認してください．",
+            file=sys.stderr,
+        )
         return 1
+
+    active_pages = set(sorted_active_pages)
 
     generate_explanations(
         args.pdf,
@@ -1549,14 +1701,15 @@ def main() -> int:
 
     tts_all = cfg.get("tts", {})
     tts_cfg = tts_all.get(lang, tts_all)
-
-    for k, page_num in enumerate(sorted_active_pages, 1):
-        text_file = explanations / f"{page_num:03d}.txt"
-        mp3 = audio / f"{page_num:03d}.mp3"
-        if text_file.exists():
-            emit_progress("tts", k, len(sorted_active_pages), page=page_num, message=f"スライド {page_num}（{k}/{len(sorted_active_pages)}）")
-            print(f"[TTS] 音声合成中: page {page_num} ({k}/{len(sorted_active_pages)})")
-            generate_tts(text_file, mp3, tts_cfg, filter_config_path, args.force, lang=lang)
+    _run_tts_stage(
+        sorted_active_pages,
+        explanations,
+        audio,
+        tts_cfg,
+        filter_config_path,
+        args.force,
+        lang,
+    )
 
     if args.start == "tts":
         print(f"TTS生成完了 (lang={lang})．")
@@ -1566,65 +1719,27 @@ def main() -> int:
     laser_img = root / "laser_dot.png"
     create_laser_dot_image(laser_img, radius=14)
 
-    videos = []
-    video_slide_indices = []
-    all_page_subtitles = []
-    accumulated_offset = 0.0
-
-    for k, page_num in enumerate(sorted_active_pages, 1):
-        image = pages / f"{page_num:03d}.png"
-        mp3_file = audio / f"{page_num:03d}.mp3"
-        text_file = explanations / f"{page_num:03d}.txt"
-        out = video / f"{page_num:03d}.mp4"
-        align_file = explanations / f"{page_num:03d}_align.json"
-
-        if not mp3_file.exists() or not image.exists():
-            continue
-
-        emit_progress("video", k, len(sorted_active_pages), page=page_num, message=f"スライド {page_num}（{k}/{len(sorted_active_pages)}）")
-        print(f"[VIDEO] スライド動画生成中: page {page_num} ({k}/{len(sorted_active_pages)})")
-
-        schedule = []
-        duration = get_audio_duration(mp3_file)
-
-        if align_file.exists():
-            align_data = json.loads(align_file.read_text(encoding="utf-8"))
-            blocks = align_data.get("blocks", [])
-            alignments = align_data.get("alignments", [])
-
-            for item in alignments:
-                item["tts_sentence"] = item["sentence"]
-
-            schedule, page_subtitles = build_pointer_schedule(blocks, alignments, duration)
-            all_page_subtitles.append((accumulated_offset, page_subtitles))
-        else:
-            all_page_subtitles.append((accumulated_offset, [{
-                "start": 0.0,
-                "end": duration,
-                "sentence": text_file.read_text(encoding="utf-8").strip() if text_file.exists() else "",
-                "ja_sentence": text_file.read_text(encoding="utf-8").strip() if (text_file.exists() and lang == "ja") else "",
-                "en_sentence": text_file.read_text(encoding="utf-8").strip() if (text_file.exists() and lang == "en") else "",
-            }]))
-
-        accumulated_offset += duration
-
-        generate_page_video(image, mp3_file, out, schedule, laser_img, cfg["video"], args.force)
-        videos.append(out)
-        video_slide_indices.append(page_num)
-
-    emit_progress("concat", len(videos), len(videos), message="完成動画を結合・生成中…")
-    final_ja_srt = root / f"{args.pdf.stem}_ja.srt"
-    create_full_srt(all_page_subtitles, final_ja_srt, lang="ja")
-
-    final_en_srt = root / f"{args.pdf.stem}_en.srt"
-    create_full_srt(all_page_subtitles, final_en_srt, lang="en")
+    video_count = _run_video_stage(
+        args.pdf,
+        root,
+        pages,
+        explanations,
+        audio,
+        video,
+        sorted_active_pages,
+        laser_img,
+        cfg["video"],
+        args.force,
+        lang,
+    )
 
     final = root / f"{args.pdf.stem}.mp4"
-    concat_videos(videos, video_slide_indices, final_ja_srt, final_en_srt, final, args.force, primary_lang=lang)
-
     print()
     print("========================================")
-    print(f"完成しました (種別: {mode}, 主言語: {lang}, 対象スライド: {len(videos)}枚)")
+    print(
+        f"完成しました (種別: {mode}, 主言語: {lang}, "
+        f"対象スライド: {video_count}枚)"
+    )
     print(final)
     print("========================================")
     return 0
