@@ -38,6 +38,7 @@ source .venv/bin/activate
 uv pip install -r requirements.txt
 
 （必要に応じて）.
+vi +61 app.py         # ログイン画面で入力するIDとパスワードを変更してください
 vi config.yaml        # OpenAI互換エンドポイントを持ったLLM，TTSサーバを指定してください．
 vi tts_filter.yaml    # OpenAI互換エンドポイントを持ったLLMを指定してください．
 ```
