@@ -226,6 +226,9 @@ def transform(
                 "content": text,
             },
         ],
+        "extra_body": {
+            "reasoning_effort" : "none",
+        }
     }
 
     if "temperature" in generation:

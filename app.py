@@ -7,9 +7,11 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Callable
 
+import httpx
 import pymupdf as fitz
 import yaml
 from fastapi.responses import FileResponse, PlainTextResponse
@@ -25,7 +27,12 @@ from slide_lecture import (
     parse_page_ranges,
     save_project_json,
 )
-from tts_filter import load_config as load_tts_filter_config
+from tts_filter import (
+    build_system_prompt as build_tts_filter_prompt,
+    load_config as load_tts_filter_config,
+    make_client as make_tts_filter_client,
+    transform_text as tts_filter_transform,
+)
 
 
 # ----------------------------------------------------------------------
@@ -1059,14 +1066,52 @@ class SlideNarratorApp:
 
     # ---- settings (modularized) ---------------------------------------
 
-    def _build_llm_settings(self) -> tuple[ui.input, ui.input, ui.number]:
+    def _build_llm_settings(self) -> tuple[ui.input, ui.input, ui.select, ui.number]:
         """LLM設定UIおよび接続テストを構築します"""
         ui.label('LLM 設定 (`config.yaml`)').classes('text-h5')
         llm = self.cfg.setdefault('llm', {})
-        with ui.row().classes('w-full'):
+        current_model = llm.get('model', '')
+
+        with ui.row().classes('w-full items-center gap-3'):
             llm_base = ui.input('LLM Base URL', value=llm.get('base_url', '')).classes('grow')
-            llm_model = ui.input('LLM Model', value=llm.get('model', '')).classes('grow')
-            llm_temp = ui.number('Temperature', value=float(llm.get('temperature', 0.3)), min=0, max=2, step=0.1).classes('w-40')
+            llm_key = ui.input('LLM API Key', value=llm.get('api_key', 'dummy'), password=True, password_toggle_button=True).classes('w-64')
+
+        with ui.row().classes('w-full items-center gap-3'):
+            initial_options = [current_model] if current_model else []
+            llm_model_select = ui.select(
+                options=initial_options,
+                value=current_model,
+                label='LLM Model (選択または直接入力)',
+            ).props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
+
+            fetch_btn = ui.button('🔄 モデル一覧を取得').props('dense outline')
+            llm_temp = ui.number('Temperature', value=float(llm.get('temperature', 0.3)), min=0, max=2, step=0.1).classes('w-36')
+
+        async def fetch_llm_models() -> None:
+            base = (llm_base.value or '').strip()
+            key = (llm_key.value or '').strip() or 'dummy'
+            if not base:
+                ui.notify('先に Base URL を入力してください．', type='warning')
+                return
+            fetch_btn.disable()
+            try:
+                client = await run.io_bound(make_client, {'base_url': base, 'api_key': key})
+                models_resp = await run.io_bound(client.models.list)
+                model_ids = sorted([m.id for m in models_resp.data])
+                if not model_ids:
+                    ui.notify('モデルが見つかりませんでした．', type='warning')
+                    return
+                llm_model_select.options = model_ids
+                if llm_model_select.value not in model_ids and model_ids:
+                    llm_model_select.value = model_ids[0]
+                llm_model_select.update()
+                ui.notify(f'{len(model_ids)} 個のモデルを取得しました．', type='positive')
+            except Exception as err:
+                ui.notify(f'モデル一覧取得に失敗しました: {err}', type='negative')
+            finally:
+                fetch_btn.enable()
+
+        fetch_btn.on_click(fetch_llm_models)
 
         with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-700 rounded-lg gap-2 mt-1'):
             ui.label('🧪 LLM 接続テスト（シングルターン会話）').classes('text-sm font-bold text-zinc-200')
@@ -1084,7 +1129,8 @@ class SlideNarratorApp:
                 if not prompt:
                     ui.notify('プロンプトを入力してください．', type='warning')
                     return
-                if not llm_base.value or not llm_model.value:
+                selected_model = (str(llm_model_select.value) if llm_model_select.value is not None else '').strip()
+                if not llm_base.value or not selected_model:
                     ui.notify('Base URL と Model を入力してください．', type='warning')
                     return
 
@@ -1093,13 +1139,13 @@ class SlideNarratorApp:
                 try:
                     test_cfg = {
                         'base_url': llm_base.value.strip(),
-                        'api_key': llm.get('api_key', 'dummy'),
+                        'api_key': (llm_key.value or '').strip() or 'dummy',
                     }
                     client = await run.io_bound(make_client, test_cfg)
 
                     def call_llm() -> str:
                         res = client.chat.completions.create(
-                            model=llm_model.value.strip(),
+                            model=selected_model,
                             temperature=float(llm_temp.value or 0.3),
                             max_tokens=1000,
                             messages=[{'role': 'user', 'content': prompt}],
@@ -1117,9 +1163,57 @@ class SlideNarratorApp:
 
             llm_test_btn.on_click(run_llm_test)
 
-        return llm_base, llm_model, llm_temp
+        return llm_base, llm_key, llm_model_select, llm_temp
 
-    def _build_tts_settings(self) -> tuple[tuple[ui.input, ui.input, ui.input], tuple[ui.input, ui.input, ui.input]]:
+    @staticmethod
+    def _fetch_voices_from_server(base_url: str, api_key: str) -> list[str]:
+        """TTSサーバからボイス/話者一覧の取得を試行します"""
+        url_clean = base_url.rstrip('/')
+        candidate_urls = [
+            f"{url_clean}/audio/voices",
+            f"{url_clean}/voices",
+        ]
+        if url_clean.endswith('/v1'):
+            root_url = url_clean[:-3]
+            candidate_urls.extend([
+                f"{root_url}/audio/voices",
+                f"{root_url}/voices",
+            ])
+
+        headers = {'Authorization': f'Bearer {api_key}'} if api_key and api_key != 'dummy' else {}
+
+        with httpx.Client(trust_env=False, verify=False, timeout=8.0) as client:
+            for endpoint in candidate_urls:
+                try:
+                    resp = client.get(endpoint, headers=headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        voices: list[str] = []
+                        if isinstance(data, list):
+                            for item in data:
+                                if isinstance(item, str):
+                                    voices.append(item)
+                                elif isinstance(item, dict):
+                                    v_id = item.get('id') or item.get('voice_id') or item.get('name')
+                                    if v_id:
+                                        voices.append(str(v_id))
+                        elif isinstance(data, dict):
+                            v_list = data.get('voices') or data.get('data') or []
+                            if isinstance(v_list, list):
+                                for item in v_list:
+                                    if isinstance(item, str):
+                                        voices.append(item)
+                                    elif isinstance(item, dict):
+                                        v_id = item.get('id') or item.get('voice_id') or item.get('name')
+                                        if v_id:
+                                            voices.append(str(v_id))
+                        if voices:
+                            return sorted(set(voices))
+                except Exception:
+                    continue
+        return []
+
+    def _build_tts_settings(self) -> tuple[tuple[ui.input, ui.input, ui.select, ui.select], tuple[ui.input, ui.input, ui.select, ui.select]]:
         """日英TTS設定UIおよび音声再生テストを構築します"""
         tts = self.cfg.setdefault('tts', {})
         ja = tts.setdefault('ja', {})
@@ -1128,10 +1222,80 @@ class SlideNarratorApp:
         # --- 日本語 TTS ---
         ui.separator().classes('my-4')
         ui.label('🇯🇵 日本語 TTS 設定 (`config.yaml: tts.ja`)').classes('text-h5')
-        with ui.row().classes('w-full'):
+        ui.label('※TTSサーバ側の実装（互換APIの有無）によって、モデル一覧や話者一覧が取得できない場合があります。その場合は直接入力してください。').classes('text-xs text-zinc-400')
+
+        with ui.row().classes('w-full items-center gap-3'):
             ja_base = ui.input('日本語 Base URL', value=ja.get('base_url', '')).classes('grow')
-            ja_model = ui.input('日本語 Model', value=ja.get('model', '')).classes('grow')
-            ja_voice = ui.input('日本語 Voice', value=ja.get('voice', '')).classes('grow')
+            ja_key = ui.input('日本語 API Key', value=ja.get('api_key', 'dummy'), password=True, password_toggle_button=True).classes('w-64')
+
+        cur_ja_model = ja.get('model', '')
+        cur_ja_voice = ja.get('voice', '')
+
+        with ui.row().classes('w-full items-center gap-3'):
+            ja_model_select = ui.select(
+                options=[cur_ja_model] if cur_ja_model else [],
+                value=cur_ja_model,
+                label='日本語 Model (選択または直接入力)',
+            ).props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
+
+            ja_model_fetch_btn = ui.button('🔄 モデル取得').props('dense outline')
+
+            ja_voice_select = ui.select(
+                options=[cur_ja_voice] if cur_ja_voice else [],
+                value=cur_ja_voice,
+                label='日本語 Voice / 話者 (選択または直接入力)',
+            ).props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
+
+            ja_voice_fetch_btn = ui.button('🗣 ボイス取得').props('dense outline')
+
+        async def fetch_ja_models() -> None:
+            base = (ja_base.value or '').strip()
+            key = (ja_key.value or '').strip() or 'dummy'
+            if not base:
+                ui.notify('先に日本語 TTS Base URL を入力してください．', type='warning')
+                return
+            ja_model_fetch_btn.disable()
+            try:
+                client = await run.io_bound(make_client, {'base_url': base, 'api_key': key})
+                models_resp = await run.io_bound(client.models.list)
+                model_ids = sorted([m.id for m in models_resp.data])
+                if not model_ids:
+                    ui.notify('モデルが見つかりませんでした．', type='warning')
+                    return
+                ja_model_select.options = model_ids
+                if ja_model_select.value not in model_ids:
+                    ja_model_select.value = model_ids[0]
+                ja_model_select.update()
+                ui.notify(f'{len(model_ids)} 個のモデルを取得しました．', type='positive')
+            except Exception as err:
+                ui.notify(f'モデル一覧取得に失敗しました（サーバが /v1/models 未対応の可能性があります）: {err}', type='negative')
+            finally:
+                ja_model_fetch_btn.enable()
+
+        async def fetch_ja_voices() -> None:
+            base = (ja_base.value or '').strip()
+            key = (ja_key.value or '').strip() or 'dummy'
+            if not base:
+                ui.notify('先に日本語 TTS Base URL を入力してください．', type='warning')
+                return
+            ja_voice_fetch_btn.disable()
+            try:
+                voices = await run.io_bound(self._fetch_voices_from_server, base, key)
+                if not voices:
+                    ui.notify('ボイス一覧を取得できませんでした（サーバが一覧APIに対応していない可能性があります）．', type='warning')
+                    return
+                ja_voice_select.options = voices
+                if ja_voice_select.value not in voices:
+                    ja_voice_select.value = voices[0]
+                ja_voice_select.update()
+                ui.notify(f'{len(voices)} 件のボイスを取得しました．', type='positive')
+            except Exception as err:
+                ui.notify(f'ボイス一覧取得に失敗しました: {err}', type='negative')
+            finally:
+                ja_voice_fetch_btn.enable()
+
+        ja_model_fetch_btn.on_click(fetch_ja_models)
+        ja_voice_fetch_btn.on_click(fetch_ja_voices)
 
         with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-700 rounded-lg gap-2 mt-1'):
             ui.label('🧪 日本語 TTS 接続・音声再生テスト').classes('text-sm font-bold text-zinc-200')
@@ -1149,7 +1313,9 @@ class SlideNarratorApp:
                 if not txt:
                     ui.notify('読み上げテキストを入力してください．', type='warning')
                     return
-                if not ja_base.value or not ja_model.value or not ja_voice.value:
+                m = (str(ja_model_select.value) if ja_model_select.value is not None else '').strip()
+                v = (str(ja_voice_select.value) if ja_voice_select.value is not None else '').strip()
+                if not ja_base.value or not m or not v:
                     ui.notify('日本語 TTS の Base URL, Model, Voice を指定してください．', type='warning')
                     return
 
@@ -1160,9 +1326,9 @@ class SlideNarratorApp:
                 try:
                     tts_cfg = {
                         'base_url': ja_base.value.strip(),
-                        'api_key': 'dummy',
-                        'model': ja_model.value.strip(),
-                        'voice': ja_voice.value.strip(),
+                        'api_key': (ja_key.value or '').strip() or 'dummy',
+                        'model': m,
+                        'voice': v,
                         'response_format': 'mp3',
                     }
                     out_path = TEST_AUDIO_DIR / 'test_ja.mp3'
@@ -1179,8 +1345,12 @@ class SlideNarratorApp:
 
                     await run.io_bound(call_tts)
                     ja_audio_container.clear()
+                    # ブラウザキャッシュを破棄するためタイムスタンプを付与
+                    ts = int(time.time() * 1000)
+                    cached_url = f"{file_url(out_path)}?t={ts}"
                     with ja_audio_container:
-                        ui.audio(file_url(out_path)).props('autoplay').classes('w-full max-w-lg mt-1')
+                        ui.audio(cached_url).props('autoplay').classes('w-full max-w-lg mt-1')
+                        ui.label(f'Model: {m} / Voice: {v} で生成完了').classes('text-xs text-zinc-400')
                     ui.notify('日本語音声を合成しました．', type='positive')
                 except Exception as err:
                     ja_audio_container.clear()
@@ -1195,10 +1365,80 @@ class SlideNarratorApp:
         # --- 英語 TTS ---
         ui.separator().classes('my-4')
         ui.label('🇺🇸 英語 TTS 設定 (`config.yaml: tts.en`)').classes('text-h5')
-        with ui.row().classes('w-full'):
+        ui.label('※TTSサーバ側の実装（互換APIの有無）によって、モデル一覧や話者一覧が取得できない場合があります。その場合は直接入力してください。').classes('text-xs text-zinc-400')
+
+        with ui.row().classes('w-full items-center gap-3'):
             en_base = ui.input('英語 Base URL', value=en.get('base_url', '')).classes('grow')
-            en_model = ui.input('英語 Model', value=en.get('model', '')).classes('grow')
-            en_voice = ui.input('英語 Voice', value=en.get('voice', '')).classes('grow')
+            en_key = ui.input('英語 API Key', value=en.get('api_key', 'dummy'), password=True, password_toggle_button=True).classes('w-64')
+
+        cur_en_model = en.get('model', '')
+        cur_en_voice = en.get('voice', '')
+
+        with ui.row().classes('w-full items-center gap-3'):
+            en_model_select = ui.select(
+                options=[cur_en_model] if cur_en_model else [],
+                value=cur_en_model,
+                label='英語 Model (選択または直接入力)',
+            ).props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
+
+            en_model_fetch_btn = ui.button('🔄 モデル取得').props('dense outline')
+
+            en_voice_select = ui.select(
+                options=[cur_en_voice] if cur_en_voice else [],
+                value=cur_en_voice,
+                label='英語 Voice / 話者 (選択または直接入力)',
+            ).props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
+
+            en_voice_fetch_btn = ui.button('🗣 ボイス取得').props('dense outline')
+
+        async def fetch_en_models() -> None:
+            base = (en_base.value or '').strip()
+            key = (en_key.value or '').strip() or 'dummy'
+            if not base:
+                ui.notify('先に英語 TTS Base URL を入力してください．', type='warning')
+                return
+            en_model_fetch_btn.disable()
+            try:
+                client = await run.io_bound(make_client, {'base_url': base, 'api_key': key})
+                models_resp = await run.io_bound(client.models.list)
+                model_ids = sorted([m.id for m in models_resp.data])
+                if not model_ids:
+                    ui.notify('モデルが見つかりませんでした．', type='warning')
+                    return
+                en_model_select.options = model_ids
+                if en_model_select.value not in model_ids:
+                    en_model_select.value = model_ids[0]
+                en_model_select.update()
+                ui.notify(f'{len(model_ids)} 個のモデルを取得しました．', type='positive')
+            except Exception as err:
+                ui.notify(f'モデル一覧取得に失敗しました（サーバが /v1/models 未対応の可能性があります）: {err}', type='negative')
+            finally:
+                en_model_fetch_btn.enable()
+
+        async def fetch_en_voices() -> None:
+            base = (en_base.value or '').strip()
+            key = (en_key.value or '').strip() or 'dummy'
+            if not base:
+                ui.notify('先に英語 TTS Base URL を入力してください．', type='warning')
+                return
+            en_voice_fetch_btn.disable()
+            try:
+                voices = await run.io_bound(self._fetch_voices_from_server, base, key)
+                if not voices:
+                    ui.notify('ボイス一覧を取得できませんでした（サーバが一覧APIに対応していない可能性があります）．', type='warning')
+                    return
+                en_voice_select.options = voices
+                if en_voice_select.value not in voices:
+                    en_voice_select.value = voices[0]
+                en_voice_select.update()
+                ui.notify(f'{len(voices)} 件のボイスを取得しました．', type='positive')
+            except Exception as err:
+                ui.notify(f'ボイス一覧取得に失敗しました: {err}', type='negative')
+            finally:
+                en_voice_fetch_btn.enable()
+
+        en_model_fetch_btn.on_click(fetch_en_models)
+        en_voice_fetch_btn.on_click(fetch_en_voices)
 
         with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-700 rounded-lg gap-2 mt-1'):
             ui.label('🧪 英語 TTS 接続・音声再生テスト').classes('text-sm font-bold text-zinc-200')
@@ -1216,7 +1456,9 @@ class SlideNarratorApp:
                 if not txt:
                     ui.notify('Text is required.', type='warning')
                     return
-                if not en_base.value or not en_model.value or not en_voice.value:
+                m = (str(en_model_select.value) if en_model_select.value is not None else '').strip()
+                v = (str(en_voice_select.value) if en_voice_select.value is not None else '').strip()
+                if not en_base.value or not m or not v:
                     ui.notify('英語 TTS の Base URL, Model, Voice を指定してください．', type='warning')
                     return
 
@@ -1227,9 +1469,9 @@ class SlideNarratorApp:
                 try:
                     tts_cfg = {
                         'base_url': en_base.value.strip(),
-                        'api_key': 'dummy',
-                        'model': en_model.value.strip(),
-                        'voice': en_voice.value.strip(),
+                        'api_key': (en_key.value or '').strip() or 'dummy',
+                        'model': m,
+                        'voice': v,
                         'response_format': 'mp3',
                     }
                     out_path = TEST_AUDIO_DIR / 'test_en.mp3'
@@ -1246,8 +1488,11 @@ class SlideNarratorApp:
 
                     await run.io_bound(call_tts)
                     en_audio_container.clear()
+                    ts = int(time.time() * 1000)
+                    cached_url = f"{file_url(out_path)}?t={ts}"
                     with en_audio_container:
-                        ui.audio(file_url(out_path)).props('autoplay').classes('w-full max-w-lg mt-1')
+                        ui.audio(cached_url).props('autoplay').classes('w-full max-w-lg mt-1')
+                        ui.label(f'Model: {m} / Voice: {v} done').classes('text-xs text-zinc-400')
                     ui.notify('英語音声を合成しました．', type='positive')
                 except Exception as err:
                     en_audio_container.clear()
@@ -1259,17 +1504,118 @@ class SlideNarratorApp:
 
             en_test_btn.on_click(run_en_tts_test)
 
-        return (ja_base, ja_model, ja_voice), (en_base, en_model, en_voice)
+        return (ja_base, ja_key, ja_model_select, ja_voice_select), (en_base, en_key, en_model_select, en_voice_select)
 
     def _build_dict_editor(self) -> None:
-        """tts_filter.yaml の単語辞書編集UIを構築します"""
+        """tts_filter.yaml のLLM設定、ヨミ変換テスト、および単語辞書編集UIを構築します"""
         filter_cfg = load_tts_filter_config(TTS_FILTER_PATH) if TTS_FILTER_PATH.exists() else {}
+        server_cfg = filter_cfg.setdefault('server', {})
+        gen_cfg = filter_cfg.setdefault('generation', {})
         filter_dict = filter_cfg.setdefault('dictionary', {})
 
         ui.separator().classes('my-4')
         ui.label('🤖 日本語TTS用ヨミ変換フィルタ (`tts_filter.yaml`)').classes('text-h5')
-        ui.label('技術用語・識別子・コマンド等の読み仮名辞書を編集できます．')
+        ui.label('技術用語・識別子・コマンド等の自動ヨミ変換に使用するLLMサーバ及び辞書の設定を行えます．').classes('text-sm text-zinc-400')
 
+        # --- フィルタ専用 LLM サーバ設定 ---
+        current_filter_model = server_cfg.get('model', '')
+        with ui.row().classes('w-full items-center gap-3 mt-2'):
+            filter_base = ui.input('フィルタ用 LLM Base URL', value=server_cfg.get('base_url', '')).classes('grow')
+            filter_key = ui.input('フィルタ用 API Key', value=server_cfg.get('api_key', 'dummy'), password=True, password_toggle_button=True).classes('w-64')
+
+        with ui.row().classes('w-full items-center gap-3'):
+            initial_filter_options = [current_filter_model] if current_filter_model else []
+            filter_model_select = ui.select(
+                options=initial_filter_options,
+                value=current_filter_model,
+                label='フィルタ用 LLM Model (選択または直接入力)',
+            ).props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
+
+            filter_fetch_btn = ui.button('🔄 モデル一覧を取得').props('dense outline')
+            filter_temp = ui.number('Temperature', value=float(gen_cfg.get('temperature', 0)), min=0, max=2, step=0.1).classes('w-36')
+
+        async def fetch_filter_models() -> None:
+            base = (filter_base.value or '').strip()
+            key = (filter_key.value or '').strip() or 'dummy'
+            if not base:
+                ui.notify('先にフィルタ用 Base URL を入力してください．', type='warning')
+                return
+            filter_fetch_btn.disable()
+            try:
+                client = await run.io_bound(make_tts_filter_client, {'server': {'base_url': base, 'api_key': key}})
+                models_resp = await run.io_bound(client.models.list)
+                model_ids = sorted([m.id for m in models_resp.data])
+                if not model_ids:
+                    ui.notify('モデルが見つかりませんでした．', type='warning')
+                    return
+                filter_model_select.options = model_ids
+                if filter_model_select.value not in model_ids and model_ids:
+                    filter_model_select.value = model_ids[0]
+                filter_model_select.update()
+                ui.notify(f'{len(model_ids)} 個のモデルを取得しました．', type='positive')
+            except Exception as err:
+                ui.notify(f'モデル一覧取得に失敗しました: {err}', type='negative')
+            finally:
+                filter_fetch_btn.enable()
+
+        filter_fetch_btn.on_click(fetch_filter_models)
+
+        # --- ヨミ変換テスト実行機能 ---
+        with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-700 rounded-lg gap-2 mt-2'):
+            ui.label('🧪 ヨミ変換フィルタ テスト').classes('text-sm font-bold text-zinc-200')
+            with ui.row().classes('w-full items-center gap-2'):
+                filter_test_input = ui.input(
+                    'テスト入力文（技術文書・プログラムなど）',
+                    value='argc と argv を確認し、/usr/bin/python で実行します。cnt++ でカウンタを増やします。',
+                ).props('dense outlined').classes('grow')
+                filter_test_btn = ui.button('🔄 ヨミ変換テスト実行').props('dense outline')
+
+            filter_test_result = ui.label('').classes('text-xs text-zinc-300 font-mono p-2 bg-zinc-800 rounded min-h-[36px] w-full whitespace-pre-wrap')
+
+            async def run_filter_test() -> None:
+                src_txt = (filter_test_input.value or '').strip()
+                if not src_txt:
+                    ui.notify('テスト対象の文章を入力してください．', type='warning')
+                    return
+                m = (str(filter_model_select.value) if filter_model_select.value is not None else '').strip()
+                b = (filter_base.value or '').strip()
+                k = (filter_key.value or '').strip() or 'dummy'
+                if not b or not m:
+                    ui.notify('フィルタ用の Base URL と Model を設定してください．', type='warning')
+                    return
+
+                filter_test_btn.disable()
+                filter_test_result.text = 'ヨミ変換中…'
+                try:
+                    test_filter_cfg = {
+                        'server': {'base_url': b, 'api_key': k, 'model': m},
+                        'generation': {'temperature': float(filter_temp.value or 0)},
+                        'dictionary': filter_dict,
+                        'prompt': filter_cfg.get('prompt'),
+                    }
+                    client = await run.io_bound(make_tts_filter_client, test_filter_cfg)
+                    system_prompt = build_tts_filter_prompt(test_filter_cfg)
+
+                    transformed = await run.io_bound(
+                        tts_filter_transform,
+                        client=client,
+                        model=m,
+                        system_prompt=system_prompt,
+                        text=src_txt,
+                        generation=test_filter_cfg['generation'],
+                    )
+                    filter_test_result.text = transformed
+                    ui.notify('ヨミ変換フィルタを適用しました．', type='positive')
+                except Exception as err:
+                    filter_test_result.text = f'【エラー】\n{err}'
+                    ui.notify(f'ヨミ変換テストに失敗しました: {err}', type='negative')
+                finally:
+                    filter_test_btn.enable()
+
+            filter_test_btn.on_click(run_filter_test)
+
+        # --- 単語辞書編集 ---
+        ui.label('📖 読み仮名辞書の編集').classes('text-subtitle1 font-bold text-zinc-200 mt-3')
         with ui.row().classes('w-full items-end'):
             new_word = ui.input('単語・識別子（例: argc）').classes('grow')
             new_reading = ui.input('読みの目安（例: アーギューシー）').classes('grow')
@@ -1296,7 +1642,7 @@ class SlideNarratorApp:
             'stopEditingWhenCellsLoseFocus': True,
         }).classes('w-full h-96')
 
-        async def save_dictionary() -> None:
+        async def save_filter_configuration() -> None:
             await grid.load_client_data()
             data = grid.options.get('rowData', [])
             new_dictionary = {}
@@ -1305,11 +1651,20 @@ class SlideNarratorApp:
                 r = str(row.get('読みの目安', '')).strip()
                 if w and r and w != 'nan' and r != 'nan':
                     new_dictionary[w] = r
+
+            filter_cfg['server'] = {
+                'base_url': (filter_base.value or '').strip(),
+                'api_key': (filter_key.value or '').strip() or 'dummy',
+                'model': (str(filter_model_select.value) if filter_model_select.value is not None else '').strip(),
+            }
+            filter_cfg['generation'] = {
+                'temperature': float(filter_temp.value or 0),
+            }
             filter_cfg['dictionary'] = new_dictionary
             save_config(TTS_FILTER_PATH, filter_cfg)
-            ui.notify(f'tts_filter.yaml を更新しました（全 {len(new_dictionary)} 件）．', type='positive')
+            ui.notify(f'tts_filter.yaml を更新しました（辞書全 {len(new_dictionary)} 件）．', type='positive')
 
-        ui.button('💾 ヨミ変換辞書 (tts_filter.yaml) を保存', on_click=save_dictionary).classes('w-full')
+        ui.button('💾 ヨミ変換設定・辞書 (tts_filter.yaml) を保存', on_click=save_filter_configuration).classes('w-full')
 
     def refresh_settings(self) -> None:
         """設定タブ全体の構築（各セクションメソッドを順次呼び出し）"""
@@ -1320,15 +1675,28 @@ class SlideNarratorApp:
         with self.settings_container:
             ui.label('システム設定').classes('text-h4')
 
-            llm_base, llm_model, llm_temp = self._build_llm_settings()
-            (ja_base, ja_model, ja_voice), (en_base, en_model, en_voice) = self._build_tts_settings()
+            llm_base, llm_key, llm_model, llm_temp = self._build_llm_settings()
+            (ja_base, ja_key, ja_model, ja_voice), (en_base, en_key, en_model, en_voice) = self._build_tts_settings()
 
             def save_main_config() -> None:
-                self.cfg['llm']['base_url'] = llm_base.value
-                self.cfg['llm']['model'] = llm_model.value
+                self.cfg['llm']['base_url'] = (llm_base.value or '').strip()
+                self.cfg['llm']['api_key'] = (llm_key.value or '').strip() or 'dummy'
+                self.cfg['llm']['model'] = (str(llm_model.value) if llm_model.value is not None else '').strip()
                 self.cfg['llm']['temperature'] = llm_temp.value
-                self.cfg['tts']['ja'] = {'base_url': ja_base.value, 'api_key': 'dummy', 'model': ja_model.value, 'voice': ja_voice.value, 'response_format': 'mp3'}
-                self.cfg['tts']['en'] = {'base_url': en_base.value, 'api_key': 'dummy', 'model': en_model.value, 'voice': en_voice.value, 'response_format': 'mp3'}
+                self.cfg['tts']['ja'] = {
+                    'base_url': (ja_base.value or '').strip(),
+                    'api_key': (ja_key.value or '').strip() or 'dummy',
+                    'model': (str(ja_model.value) if ja_model.value is not None else '').strip(),
+                    'voice': (str(ja_voice.value) if ja_voice.value is not None else '').strip(),
+                    'response_format': 'mp3',
+                }
+                self.cfg['tts']['en'] = {
+                    'base_url': (en_base.value or '').strip(),
+                    'api_key': (en_key.value or '').strip() or 'dummy',
+                    'model': (str(en_model.value) if en_model.value is not None else '').strip(),
+                    'voice': (str(en_voice.value) if en_voice.value is not None else '').strip(),
+                    'response_format': 'mp3',
+                }
                 save_config(CONFIG_PATH, self.cfg)
                 ui.notify('config.yaml を保存しました．', type='positive')
 
