@@ -1,4 +1,21 @@
 #!/usr/bin/env python3
+
+# Copyright (C) 2026 Daisuke Takago
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+
 from __future__ import annotations
 
 import asyncio
@@ -14,7 +31,7 @@ from typing import Any, Callable
 import httpx
 import pymupdf as fitz
 import yaml
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from nicegui import app, run, ui
 from PIL import Image, ImageDraw
 
@@ -33,6 +50,16 @@ from tts_filter import (
     make_client as make_tts_filter_client,
     transform_text as tts_filter_transform,
 )
+
+
+# ----------------------------------------------------------------------
+# Authentication Configuration
+# ----------------------------------------------------------------------
+
+# ユーザー名とパスワード（運用環境に合わせて変更してください）
+USERS = {
+    'admin': 'secret',
+}
 
 
 # ----------------------------------------------------------------------
@@ -1743,9 +1770,17 @@ class SlideNarratorApp:
         ui.dark_mode().enable()
         ui.colors(primary='#3b82f6')
 
+        def logout() -> None:
+            app.storage.user.clear()
+            ui.navigate.to('/login')
+
         with ui.header().classes('items-center w-full px-4 bg-slate-900 border-b border-slate-800'):
             ui.label('🎓 Slide Narrator').classes('text-h5 text-white')
             ui.space()
+            username = app.storage.user.get('username', '')
+            if username:
+                ui.label(f'👤 {username}').classes('text-caption text-slate-400 mr-2')
+            ui.button('ログアウト', on_click=logout).props('dense outline size=sm color=white').classes('mr-3')
             ui.label('TAKAGO_LAB. 2026').classes('text-subtitle2 font-mono tracking-wider text-slate-300 mr-2')
 
         with ui.left_drawer(value=True).props('width=320').classes('p-4'):
@@ -1853,8 +1888,45 @@ class SlideNarratorApp:
             ui.notify(f'スライド範囲を解釈できません: {exc}', type='negative')
 
 
-application = SlideNarratorApp()
-application.build()
+@ui.page('/')
+def index_page():
+    if not app.storage.user.get('authenticated', False):
+        return RedirectResponse('/login')
+    app_instance = SlideNarratorApp()
+    app_instance.build()
 
-ui.run(title='Slide Narrator', reload=False)
-# ui.run(title='Slide Narrator', reload=False, show=False, port=17171,host='0.0.0.0')
+
+@ui.page('/login')
+def login_page():
+    if app.storage.user.get('authenticated', False):
+        return RedirectResponse('/')
+
+    ui.page_title('Slide Narrator - ログイン')
+    ui.dark_mode().enable()
+    ui.colors(primary='#3b82f6')
+
+    def try_login() -> None:
+        username = (username_input.value or '').strip()
+        password = password_input.value or ''
+        if USERS.get(username) == password:
+            app.storage.user['authenticated'] = True
+            app.storage.user['username'] = username
+            ui.navigate.to('/')
+        else:
+            ui.notify('ユーザー名またはパスワードが正しくありません．', type='negative')
+
+    with ui.card().classes('absolute-center w-96 p-6 bg-zinc-900 border border-zinc-800 rounded-xl shadow-lg gap-4'):
+        with ui.column().classes('w-full items-center gap-1'):
+            ui.label('🎓 Slide Narrator').classes('text-h5 font-bold text-white')
+            ui.label('サインインして続行してください').classes('text-xs text-zinc-400')
+
+        username_input = ui.input('ユーザー名').props('outlined dense autofocus').classes('w-full')
+        password_input = ui.input('パスワード', password=True, password_toggle_button=True).props('outlined dense').classes('w-full')
+        password_input.on('keydown.enter', try_login)
+        username_input.on('keydown.enter', try_login)
+
+        ui.button('ログイン', on_click=try_login).props('color=primary').classes('w-full mt-2')
+
+
+ui.run(title='Slide Narrator', reload=False, storage_secret='slide-narrator-session-secret-key-change-in-prod')
+# ui.run(title='Slide Narrator', reload=False, show=False, port=17171, host='0.0.0.0', storage_secret='slide-narrator-session-secret-key-change-in-prod')
