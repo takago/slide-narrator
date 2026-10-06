@@ -22,6 +22,8 @@ from slide_lecture import (
     build_course_overview,
     extract_page_text,
     generate_single_alignment,
+    generate_single_explanation,
+    generate_tts,
     load_project_json,
     make_client,
     make_explanation,
@@ -59,77 +61,83 @@ def run_command(args: list[str]) -> tuple[int, str]:
     return p.returncode, p.stdout + '\n' + p.stderr
 
 
-def project_root(pdf: Path) -> Path:
-    return pdf.with_name(pdf.stem + '_lecture')
+# ----------------------------------------------------------------------
+# Project Paths Manager
+# ----------------------------------------------------------------------
 
+class ProjectPaths:
+    """プロジェクト配下の各種ファイルパスを一元管理するヘルパークラス"""
 
-def explanation_path(pdf: Path, page: int) -> Path:
-    return project_root(pdf) / 'explanations' / f'{page:03d}.txt'
+    def __init__(self, pdf: Path) -> None:
+        self.pdf = pdf
+        self.root = pdf.with_name(pdf.stem + '_lecture')
+        self.pages_dir = self.root / 'pages'
+        self.explanations_dir = self.root / 'explanations'
+        self.audio_dir = self.root / 'audio'
+        self.video_dir = self.root / 'video'
 
+    def explanation(self, page: int) -> Path:
+        return self.explanations_dir / f'{page:03d}.txt'
 
-def alignment_path(pdf: Path, page: int) -> Path:
-    return project_root(pdf) / 'explanations' / f'{page:03d}_align.json'
+    def alignment(self, page: int) -> Path:
+        return self.explanations_dir / f'{page:03d}_align.json'
 
+    def page_image(self, page: int) -> Path:
+        return self.pages_dir / f'{page:03d}.png'
 
-def page_image_path(pdf: Path, page: int) -> Path:
-    return project_root(pdf) / 'pages' / f'{page:03d}.png'
+    def page_preview(self, page: int) -> Path:
+        return self.pages_dir / f'{page:03d}_preview.png'
 
+    def audio(self, page: int) -> Path:
+        return self.audio_dir / f'{page:03d}.mp3'
 
-def audio_path(pdf: Path, page: int) -> Path:
-    return project_root(pdf) / 'audio' / f'{page:03d}.mp3'
+    def video(self, page: int) -> Path:
+        return self.video_dir / f'{page:03d}.mp4'
 
+    @property
+    def final_video(self) -> Path:
+        return self.root / f'{self.pdf.stem}.mp4'
 
-def video_path(pdf: Path, page: int) -> Path:
-    return project_root(pdf) / 'video' / f'{page:03d}.mp4'
+    @property
+    def final_ja_srt(self) -> Path:
+        return self.root / f'{self.pdf.stem}_ja.srt'
 
+    @property
+    def final_en_srt(self) -> Path:
+        return self.root / f'{self.pdf.stem}_en.srt'
 
-def final_video_path(pdf: Path) -> Path:
-    return project_root(pdf) / f'{pdf.stem}.mp4'
-
-
-def final_ja_srt_path(pdf: Path) -> Path:
-    return project_root(pdf) / f'{pdf.stem}_ja.srt'
-
-
-def final_en_srt_path(pdf: Path) -> Path:
-    return project_root(pdf) / f'{pdf.stem}_en.srt'
-
-
-def cleanup_downstream_media(pdf: Path, page: int | None = None, include_alignment: bool = False) -> None:
-    for f in [final_video_path(pdf), final_ja_srt_path(pdf), final_en_srt_path(pdf)]:
-        if f.exists():
-            f.unlink()
-
-    if page is not None:
-        if include_alignment:
-            f = alignment_path(pdf, page)
+    def cleanup_downstream(self, page: int | None = None, include_alignment: bool = False) -> None:
+        """下流のメディアファイル（動画・音声・字幕）を無効化・削除します"""
+        for f in [self.final_video, self.final_ja_srt, self.final_en_srt]:
             if f.exists():
                 f.unlink()
-        for f in [audio_path(pdf, page), video_path(pdf, page)]:
-            if f.exists():
-                f.unlink()
-    else:
-        root = project_root(pdf)
-        if include_alignment:
-            exp_d = root / 'explanations'
-            if exp_d.exists():
-                for f in exp_d.glob('*_align.json'):
+
+        if page is not None:
+            if include_alignment:
+                f = self.alignment(page)
+                if f.exists():
                     f.unlink()
-        for d in [root / 'audio', root / 'video']:
-            if d.exists():
-                for f in d.glob('*'):
-                    if f.is_file():
-                        f.unlink()
+            for f in [self.audio(page), self.video(page)]:
+                if f.exists():
+                    f.unlink()
+        else:
+            if include_alignment and self.explanations_dir.exists():
+                for f in self.explanations_dir.glob('*_align.json'):
+                    f.unlink()
+            for d in [self.audio_dir, self.video_dir]:
+                if d.exists():
+                    for f in d.glob('*'):
+                        if f.is_file():
+                            f.unlink()
 
 
-def ensure_page_images(pdf: Path, dpi: int = 120) -> list[Path]:
-    pages_dir = project_root(pdf) / 'pages'
-    pages_dir.mkdir(parents=True, exist_ok=True)
-    doc = fitz.open(pdf)
+def ensure_page_images(paths: ProjectPaths, dpi: int = 120) -> list[Path]:
+    paths.pages_dir.mkdir(parents=True, exist_ok=True)
+    doc = fitz.open(paths.pdf)
     result: list[Path] = []
     matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
     for i, page in enumerate(doc, 1):
-        out = pages_dir / f'{i:03d}.png'
+        out = paths.page_image(i)
         result.append(out)
         if not out.exists():
             page.get_pixmap(matrix=matrix, alpha=False).save(out)
@@ -212,16 +220,18 @@ class SlideNarratorApp:
     def __init__(self) -> None:
         self.cfg = load_config(CONFIG_PATH)
         self.pdf: Path | None = None
+        self.paths: ProjectPaths | None = None
         self.images: list[Path] = []
         self.proj_cfg: dict[str, Any] = {}
         self.mode_code = 'lecture'
         self.lang_code = 'ja'
-        self.pages_spec = ''
         self.force_run = False
-        self.active_pages: list[int] = []
         self.edit_page: int | None = None
         self.log = ''
         self.processing = False
+
+        # スライド選択状態の単一の真実（Single Source of Truth）
+        self._selected_pages: set[int] = set()
 
         # プロセスおよび非同期キャンセルの追跡
         self.current_process: asyncio.subprocess.Process | None = None
@@ -244,6 +254,71 @@ class SlideNarratorApp:
         self.force_checkbox = None
         self.pipeline_buttons = []
 
+    # ---- Slide state properties / helpers ------------------------------
+
+    @property
+    def total_slides(self) -> int:
+        return len(self.images)
+
+    @property
+    def active_pages(self) -> list[int]:
+        return sorted(self._selected_pages)
+
+    @property
+    def pages_spec(self) -> str:
+        if not self.pdf or self.total_slides == 0:
+            return ''
+        if not self._selected_pages:
+            return 'none'
+        if len(self._selected_pages) == self.total_slides:
+            return ''
+        return format_page_ranges(self.active_pages)
+
+    def get_slide_order(self, page_num: int) -> int:
+        if page_num in self._selected_pages:
+            return self.active_pages.index(page_num) + 1
+        return 0
+
+    def apply_pages_spec(self, spec: str, save_and_refresh: bool = True) -> None:
+        if not self.pdf or self.total_slides == 0:
+            self._selected_pages = set()
+        else:
+            raw = spec.strip()
+            if raw == 'none':
+                self._selected_pages = set()
+            elif raw:
+                self._selected_pages = parse_page_ranges(raw) & set(range(1, self.total_slides + 1))
+            else:
+                self._selected_pages = set(range(1, self.total_slides + 1))
+
+        self._on_pages_updated(sync_input=(self.pages_input and self.pages_input.value != self.pages_spec),
+                               save=save_and_refresh, refresh=save_and_refresh)
+
+    def _on_pages_updated(self, sync_input: bool = True, save: bool = True, refresh: bool = True) -> None:
+        if self.edit_page not in self._selected_pages:
+            self.edit_page = self.active_pages[0] if self.active_pages else None
+
+        if sync_input and self.pages_input:
+            self.pages_input.value = self.pages_spec
+
+        if self.active_count_label:
+            self.active_count_label.text = f'対象スライド: {len(self._selected_pages)} / {self.total_slides} スライド'
+
+        if save:
+            self.save_project_settings()
+
+        if refresh:
+            self.request_views_refresh()
+
+    def request_views_refresh(self) -> None:
+        asyncio.create_task(self.refresh_views())
+
+    async def refresh_views(self) -> None:
+        await self.refresh_gallery()
+        await self.refresh_simple_editor()
+        await self.refresh_editor()
+        await self.refresh_slide_videos()
+
     # ---- project ------------------------------------------------------
 
     async def load_pdf(self, e) -> None:
@@ -251,14 +326,20 @@ class SlideNarratorApp:
         pdf = UPLOAD_DIR / filename
         if not pdf.exists() or pdf.stat().st_size != e.file.size():
             await e.file.save(pdf)
+
         self.pdf = pdf
-        self.proj_cfg = load_project_json(project_root(pdf))
+        self.paths = ProjectPaths(pdf)
+        self.proj_cfg = load_project_json(self.paths.root)
         self.mode_code = self.proj_cfg.get('mode') or self.cfg.get('mode', 'lecture')
         self.lang_code = self.proj_cfg.get('language') or self.cfg.get('language', 'ja')
-        self.pages_spec = self.proj_cfg.get('pages', '')
+
         self.images = await run.io_bound(
-            ensure_page_images, pdf, int(self.cfg.get('pdf', {}).get('dpi', 120))
+            ensure_page_images, self.paths, int(self.cfg.get('pdf', {}).get('dpi', 120))
         )
+
+        saved_pages_spec = self.proj_cfg.get('pages', '')
+        self.apply_pages_spec(saved_pages_spec, save_and_refresh=False)
+
         self.refresh_project_widgets()
         await self.refresh_all()
         ui.notify(f'プレゼンテーションを読み込みました: {pdf.name}', type='positive')
@@ -272,84 +353,37 @@ class SlideNarratorApp:
             self.lang_select.value = self.lang_code
         if self.pages_input:
             self.pages_input.value = self.pages_spec
+        if self.active_count_label:
+            self.active_count_label.text = f'対象スライド: {len(self._selected_pages)} / {self.total_slides} スライド'
 
     def save_project_settings(self) -> None:
-        if not self.pdf:
+        if not self.paths:
             return
-        root = project_root(self.pdf)
         self.proj_cfg.update({
             'mode': self.mode_code,
             'language': self.lang_code,
             'pages': self.pages_spec,
             'skip_pages': '',
         })
-        save_project_json(root, self.proj_cfg)
-
-    def recalculate_pages(self) -> None:
-        if not self.pdf:
-            self.active_pages = []
-            return
-        total = len(self.images)
-        active = set(range(1, total + 1))
-        if self.pages_spec.strip() and self.pages_spec.strip() != 'none':
-            active &= parse_page_ranges(self.pages_spec.strip())
-        elif self.pages_spec.strip() == 'none':
-            active = set()
-        self.active_pages = sorted(active)
-        if self.edit_page not in self.active_pages:
-            self.edit_page = self.active_pages[0] if self.active_pages else None
-        if self.active_count_label:
-            self.active_count_label.text = f'対象スライド: {len(self.active_pages)} / {total} スライド'
+        save_project_json(self.paths.root, self.proj_cfg)
 
     def toggle_slide_active(self, page_num: int, active: bool) -> None:
-        cur = set(self.active_pages)
         if active:
-            cur.add(page_num)
+            self._selected_pages.add(page_num)
         else:
-            cur.discard(page_num)
-
-        total = len(self.images)
-        if len(cur) == total:
-            self.pages_spec = ''
-        elif not cur:
-            self.pages_spec = 'none'
-        else:
-            self.pages_spec = format_page_ranges(sorted(cur))
-
-        if self.pages_input:
-            self.pages_input.value = self.pages_spec
-
-        self.recalculate_pages()
-        self.save_project_settings()
-        asyncio.create_task(self.refresh_gallery())
-        asyncio.create_task(self.refresh_simple_editor())
-        asyncio.create_task(self.refresh_editor())
-        asyncio.create_task(self.refresh_slide_videos())
+            self._selected_pages.discard(page_num)
+        self._on_pages_updated(sync_input=True, save=True, refresh=True)
 
     def select_all_slides(self) -> None:
-        self.pages_spec = ''
-        if self.pages_input:
-            self.pages_input.value = ''
-        self.recalculate_pages()
-        self.save_project_settings()
-        asyncio.create_task(self.refresh_gallery())
-        asyncio.create_task(self.refresh_simple_editor())
-        asyncio.create_task(self.refresh_editor())
-        asyncio.create_task(self.refresh_slide_videos())
+        if self.pdf and self.total_slides > 0:
+            self._selected_pages = set(range(1, self.total_slides + 1))
+        else:
+            self._selected_pages = set()
+        self._on_pages_updated(sync_input=True, save=True, refresh=True)
 
     def clear_all_slides(self) -> None:
-        self.pages_spec = 'none'
-        if self.pages_input:
-            self.pages_input.value = 'none'
-        self.active_pages = []
-        self.edit_page = None
-        if self.active_count_label:
-            self.active_count_label.text = f'対象スライド: 0 / {len(self.images)} スライド'
-        self.save_project_settings()
-        asyncio.create_task(self.refresh_gallery())
-        asyncio.create_task(self.refresh_simple_editor())
-        asyncio.create_task(self.refresh_editor())
-        asyncio.create_task(self.refresh_slide_videos())
+        self._selected_pages = set()
+        self._on_pages_updated(sync_input=True, save=True, refresh=True)
 
     # ---- pipeline / process control -----------------------------------
 
@@ -367,46 +401,38 @@ class SlideNarratorApp:
                 progress_bar = ui.linear_progress(value=0.0, show_value=False).props('rounded size=14px').classes('grow')
                 percent_label = ui.label('0%').classes('text-xs font-mono font-bold w-12 text-right text-zinc-300')
 
-            # --- スライド3枚プレビュー（前・現在・次） ---
-            slide_preview_row = ui.row().classes('w-full items-center justify-center gap-3 py-2 bg-zinc-900/60 rounded-lg border border-zinc-800')
+            slide_preview_row = ui.row().classes('w-full items-end justify-center gap-3 py-2')
             with slide_preview_row:
-                # 前スライド (縮小・半透明)
                 with ui.column().classes('items-center w-28 opacity-45'):
-                    prev_label = ui.label('前スライド').classes('text-[11px] text-zinc-400 mb-0.5')
-                    prev_img_box = ui.column().classes('w-28 h-18 bg-zinc-800 rounded border border-zinc-700 items-center justify-center overflow-hidden')
+                    prev_img_box = ui.column().classes('w-28 h-18 items-center justify-center overflow-hidden')
                     with prev_img_box:
                         prev_image = ui.image('').classes('w-full rounded').style('display: none')
                         prev_placeholder = ui.label('-').classes('text-xs text-zinc-500')
 
-                # 現在処理中のスライド (中央・拡大・中立なグレー枠)
-                with ui.column().classes('items-center w-48 shadow-lg scale-105 transition-all'):
-                    curr_label = ui.label('現在処理中').classes('text-xs font-bold text-zinc-300 mb-0.5')
-                    curr_img_box = ui.column().classes('w-48 h-30 bg-zinc-800 rounded-lg border border-zinc-700 shadow-md items-center justify-center overflow-hidden')
+                with ui.column().classes('items-center w-48 scale-105 transition-all'):
+                    curr_img_box = ui.column().classes('w-48 h-30 items-center justify-center overflow-hidden')
                     with curr_img_box:
                         curr_image = ui.image('').classes('w-full rounded').style('display: none')
                         curr_placeholder = ui.label('スライド待機中').classes('text-xs text-zinc-400')
 
-                # 次スライド (縮小・半透明)
                 with ui.column().classes('items-center w-28 opacity-45'):
-                    next_label = ui.label('次スライド').classes('text-[11px] text-zinc-400 mb-0.5')
-                    next_img_box = ui.column().classes('w-28 h-18 bg-zinc-800 rounded border border-zinc-700 items-center justify-center overflow-hidden')
+                    next_img_box = ui.column().classes('w-28 h-18 items-center justify-center overflow-hidden')
                     with next_img_box:
                         next_image = ui.image('').classes('w-full rounded').style('display: none')
                         next_placeholder = ui.label('-').classes('text-xs text-zinc-500')
 
-            # 処理中のダイアログ内リアルタイム・スクロール可能ログ
             with ui.expansion('詳細ログを表示', icon='terminal').classes('w-full border border-zinc-700 rounded-lg text-xs mt-1'):
                 dialog_log = ui.log(max_lines=300).classes('w-full h-40 font-mono text-xs bg-zinc-900 text-zinc-300 p-2')
 
             with ui.row().classes('w-full justify-center pt-2'):
-                ui.button('🛑 処理を中断', on_click=self.request_cancel, color='negative').props('outline')
+                ui.button('処理を中断', on_click=self.request_cancel, color='negative').props('text-color=white')
 
         dialog.open()
 
         def update_slide_preview(current_page: int | None) -> None:
-            if not self.pdf or current_page is None:
+            if not self.paths or current_page is None:
                 return
-            pages_list = self.active_pages if self.active_pages else list(range(1, len(self.images) + 1))
+            pages_list = self.active_pages if self.active_pages else list(range(1, self.total_slides + 1))
             if current_page not in pages_list:
                 return
 
@@ -414,39 +440,31 @@ class SlideNarratorApp:
             prev_p = pages_list[idx - 1] if idx > 0 else None
             next_p = pages_list[idx + 1] if idx + 1 < len(pages_list) else None
 
-            # 前スライド
             if prev_p is not None:
-                p_path = page_image_path(self.pdf, prev_p)
+                p_path = self.paths.page_image(prev_p)
                 if p_path.exists():
                     prev_image.set_source(file_url(p_path))
                     prev_image.style('display: block')
                     prev_placeholder.style('display: none')
-                    prev_label.text = f'スライド {prev_p}'
             else:
                 prev_image.style('display: none')
                 prev_placeholder.style('display: block')
-                prev_label.text = ''
 
-            # 現在スライド
-            c_path = page_image_path(self.pdf, current_page)
+            c_path = self.paths.page_image(current_page)
             if c_path.exists():
                 curr_image.set_source(file_url(c_path))
                 curr_image.style('display: block')
                 curr_placeholder.style('display: none')
-                curr_label.text = f'スライド {current_page}'
 
-            # 次スライド
             if next_p is not None:
-                n_path = page_image_path(self.pdf, next_p)
+                n_path = self.paths.page_image(next_p)
                 if n_path.exists():
                     next_image.set_source(file_url(n_path))
                     next_image.style('display: block')
                     next_placeholder.style('display: none')
-                    next_label.text = f'スライド {next_p}'
             else:
                 next_image.style('display: none')
                 next_placeholder.style('display: block')
-                next_label.text = ''
 
         def update_status(text: str, frac: float | None = None, title: str | None = None, current_page: int | None = None) -> None:
             if title is not None:
@@ -467,7 +485,6 @@ class SlideNarratorApp:
         return dialog, update_status, dialog_log.push
 
     async def request_cancel(self) -> None:
-        """実行中のプロセスおよびタスクを中断します．"""
         if self.cancellation_requested:
             return
         self.cancellation_requested = True
@@ -517,7 +534,7 @@ class SlideNarratorApp:
         dialog, update_status, push_log = self.open_processing_dialog(initial_title)
         self.set_processing(True)
 
-        total_slides = len(self.active_pages) or 1
+        total_active_slides = len(self.active_pages)
         cmd = [sys.executable, '-u', 'slide_lecture.py', str(self.pdf), '--from', stage, *self.base_args()]
 
         env = os.environ.copy()
@@ -552,7 +569,6 @@ class SlideNarratorApp:
                 if self.history_log_widget:
                     self.history_log_widget.push(line)
 
-                # ① ナレーション生成フェーズ
                 if '[LLM] ナレーション生成:' in line:
                     m_p = re.search(r'page (\d+)/', line)
                     m_frac = re.search(r'\((\d+)/(\d+)\)', line)
@@ -565,25 +581,23 @@ class SlideNarratorApp:
                     m = re.search(r'(\d{3})\.txt', line)
                     if m:
                         p_num = int(m.group(1))
-                        idx = self.active_pages.index(p_num) + 1 if p_num in self.active_pages else 1
-                        update_status(f'既存原稿を再利用: スライド {p_num} ({idx}/{total_slides})', idx / total_slides, title='① ナレーション原稿を確認中…', current_page=p_num)
+                        idx = self.get_slide_order(p_num) or 1
+                        update_status(f'既存原稿を再利用: スライド {p_num} ({idx}/{total_active_slides})', idx / total_active_slides, title='① ナレーション原稿を確認中…', current_page=p_num)
 
-                # ② 字幕・視線誘導アライメントフェーズ
                 elif '[ALIGN] 字幕＆ポインタ解析:' in line:
                     m = re.search(r'page (\d+)/', line)
                     if m:
                         p_num = int(m.group(1))
-                        idx = self.active_pages.index(p_num) + 1 if p_num in self.active_pages else 1
-                        update_status(f'スライド {p_num} ({idx}/{total_slides})', idx / total_slides, title='② 字幕・ポインタを解析中…', current_page=p_num)
+                        idx = self.get_slide_order(p_num) or 1
+                        update_status(f'スライド {p_num} ({idx}/{total_active_slides})', idx / total_active_slides, title='② 字幕・ポインタを解析中…', current_page=p_num)
 
                 elif '[ALIGN] reuse' in line:
                     m = re.search(r'(\d{3})_align\.json', line)
                     if m:
                         p_num = int(m.group(1))
-                        idx = self.active_pages.index(p_num) + 1 if p_num in self.active_pages else 1
-                        update_status(f'既存データを再利用: スライド {p_num} ({idx}/{total_slides})', idx / total_slides, title='② 字幕・ポインタを確認中…', current_page=p_num)
+                        idx = self.get_slide_order(p_num) or 1
+                        update_status(f'既存データを再利用: スライド {p_num} ({idx}/{total_active_slides})', idx / total_active_slides, title='② 字幕・ポインタを確認中…', current_page=p_num)
 
-                # ③ TTS 音声合成フェーズ
                 elif '[TTS] 音声合成中:' in line or '[TTS' in line:
                     m_page = re.search(r'page (\d+)', line) or re.search(r'(\d{3})\.mp3', line)
                     m_prog = re.search(r'\((\d+)/(\d+)\)', line)
@@ -592,11 +606,10 @@ class SlideNarratorApp:
                         cur, tot = int(m_prog.group(1)), int(m_prog.group(2))
                         update_status(f'スライド ({cur}/{tot})', cur / tot, title=f'③ 音声を合成中 ({self.lang_code})…', current_page=p_num)
                     elif p_num:
-                        idx = self.active_pages.index(p_num) + 1 if p_num in self.active_pages else 1
+                        idx = self.get_slide_order(p_num) or 1
                         action = '既存音声を再利用' if 'reuse' in line else '音声合成完了'
-                        update_status(f'{action}: スライド {p_num} ({idx}/{total_slides})', idx / total_slides, title=f'③ 音声を合成中 ({self.lang_code})…', current_page=p_num)
+                        update_status(f'{action}: スライド {p_num} ({idx}/{total_active_slides})', idx / total_active_slides, title=f'③ 音声を合成中 ({self.lang_code})…', current_page=p_num)
 
-                # ④ 動画生成フェーズ
                 elif '[VIDEO] スライド動画生成中:' in line or '[VIDEO]' in line:
                     weight = 0.85 if stage == 'video' else 1.0
                     m_page = re.search(r'page (\d+)', line) or re.search(r'(\d{3})\.mp4', line)
@@ -608,10 +621,10 @@ class SlideNarratorApp:
                         frac = (cur / tot) * weight
                         update_status(f'スライド ({cur}/{tot})', frac, title='④ スライド動画をレンダリング中…', current_page=p_num)
                     elif p_num:
-                        idx = self.active_pages.index(p_num) + 1 if p_num in self.active_pages else 1
-                        frac = (idx / total_slides) * weight
+                        idx = self.get_slide_order(p_num) or 1
+                        frac = (idx / total_active_slides) * weight
                         action = '既存動画を再利用' if 'reuse' in line else 'レンダリング完了'
-                        update_status(f'{action}: スライド {p_num} ({idx}/{total_slides})', frac, title='④ スライド動画をレンダリング中…', current_page=p_num)
+                        update_status(f'{action}: スライド {p_num} ({idx}/{total_active_slides})', frac, title='④ スライド動画をレンダリング中…', current_page=p_num)
 
                 elif '[CONCAT]' in line or 'concat' in line.lower():
                     update_status('全スライド動画の結合＆字幕トラック埋め込み中…', 0.92, title='④ 完成動画を結合・生成中…')
@@ -647,9 +660,9 @@ class SlideNarratorApp:
     # ---- edit tab -----------------------------------------------------
 
     def alignment_data(self, page: int) -> tuple[dict, list[dict], list[dict]]:
-        if not self.pdf:
+        if not self.paths:
             return {}, [], []
-        p = alignment_path(self.pdf, page)
+        p = self.paths.alignment(page)
         if not p.exists():
             return {}, [], []
         data = json.loads(p.read_text(encoding='utf-8'))
@@ -660,19 +673,19 @@ class SlideNarratorApp:
         await self.refresh_editor()
 
     async def prev_edit(self) -> None:
-        if self.edit_page in self.active_pages:
+        if self.edit_page in self._selected_pages:
             i = self.active_pages.index(self.edit_page)
             if i > 0:
                 await self.select_edit_page(self.active_pages[i - 1])
 
     async def next_edit(self) -> None:
-        if self.edit_page in self.active_pages:
+        if self.edit_page in self._selected_pages:
             i = self.active_pages.index(self.edit_page)
             if i + 1 < len(self.active_pages):
                 await self.select_edit_page(self.active_pages[i + 1])
 
     async def regenerate_narration(self, page: int, text_area) -> None:
-        if not self.pdf:
+        if not self.pdf or not self.paths:
             return
         if self.processing:
             ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
@@ -684,61 +697,30 @@ class SlideNarratorApp:
             update_status('全体概要と前後文脈をロード中…', 0.2, current_page=page)
             push_log(f'[REGEN] スライド {page} ナレーション再生成開始')
             await asyncio.sleep(0.01)
+
             cfg = self.cfg
             client = await run.io_bound(make_client, cfg['llm'])
-            page_texts = await run.io_bound(extract_page_text, self.pdf)
-            exp_dir = project_root(self.pdf) / 'explanations'
-            overview_path = exp_dir / '_course_overview.txt'
-            if overview_path.exists():
-                overview = overview_path.read_text(encoding='utf-8')
-            else:
-                update_status('プレゼンテーション全体の概要を構築中…', 0.4, current_page=page)
-                await asyncio.sleep(0.01)
-                overview = await run.io_bound(
-                    build_course_overview, client, cfg['llm'], page_texts,
-                    mode=self.mode_code, lang=self.lang_code,
-                )
-                exp_dir.mkdir(parents=True, exist_ok=True)
-                overview_path.write_text(overview + '\n', encoding='utf-8')
-
-            cur_idx = self.active_pages.index(page)
-            prev_idx = self.active_pages[cur_idx - 1] - 1 if cur_idx > 0 else None
-            next_idx = self.active_pages[cur_idx + 1] - 1 if cur_idx + 1 < len(self.active_pages) else None
-            prev_text = page_texts[prev_idx] if prev_idx is not None else None
-            next_text = page_texts[next_idx] if next_idx is not None else None
-            prev_exp_path = explanation_path(self.pdf, self.active_pages[cur_idx - 1]) if cur_idx > 0 else None
-            prev_explanation = prev_exp_path.read_text(encoding='utf-8').strip() if prev_exp_path and prev_exp_path.exists() else ''
 
             update_status(f'LLMでスライド {page} の解説文を推論中…', 0.7, current_page=page)
             push_log(f'[REGEN] LLM推論中...')
             await asyncio.sleep(0.01)
+
+            # slide_lecture.py 側の統一ロジックを呼び出し
             new_narration = await run.io_bound(
-                make_explanation,
+                generate_single_explanation,
                 client=client,
                 cfg=cfg['llm'],
-                image=page_image_path(self.pdf, page),
-                current_page=page,
-                current_text=page_texts[page - 1],
-                prev_page=prev_idx + 1 if prev_idx is not None else None,
-                prev_text=prev_text,
-                next_page=next_idx + 1 if next_idx is not None else None,
-                next_text=next_text,
-                previous_explanation=prev_explanation,
-                course_overview=overview,
-                total_active=len(self.active_pages),
-                active_idx=cur_idx,
+                pdf=self.pdf,
+                images=self.images,
+                out_dir=self.paths.explanations_dir,
+                page=page,
+                active_pages=self.active_pages,
                 mode=self.mode_code,
                 lang=self.lang_code,
             )
 
             if not self.cancellation_requested:
-                ep = explanation_path(self.pdf, page)
-                ep.parent.mkdir(parents=True, exist_ok=True)
-                temp_ep = ep.with_name(f".{ep.name}.tmp")
-                temp_ep.write_text(new_narration.strip() + '\n', encoding='utf-8')
-                temp_ep.replace(ep)
-
-                cleanup_downstream_media(self.pdf, page, include_alignment=True)
+                self.paths.cleanup_downstream(page, include_alignment=True)
                 text_area.value = new_narration.strip()
                 update_status('完了しました！', 1.0, current_page=page)
                 push_log(f'[REGEN] 完了: 新しいナレーションを保存しました')
@@ -756,9 +738,9 @@ class SlideNarratorApp:
             dialog.close()
 
     async def save_and_realign(self, page: int, text: str) -> None:
-        if not self.pdf:
+        if not self.pdf or not self.paths:
             return
-        ep = explanation_path(self.pdf, page)
+        ep = self.paths.explanation(page)
         ep.parent.mkdir(parents=True, exist_ok=True)
         temp_ep = ep.with_name(f".{ep.name}.tmp")
         temp_ep.write_text(text.rstrip() + '\n', encoding='utf-8')
@@ -779,17 +761,17 @@ class SlideNarratorApp:
             data = await run.io_bound(
                 generate_single_alignment,
                 client, self.cfg['llm'], self.pdf, page,
-                page_image_path(self.pdf, page), text.strip(), dpi, self.lang_code,
+                self.paths.page_image(page), text.strip(), dpi, self.lang_code,
             )
 
             if not self.cancellation_requested:
-                alp = alignment_path(self.pdf, page)
+                alp = self.paths.alignment(page)
                 alp.parent.mkdir(parents=True, exist_ok=True)
                 temp_alp = alp.with_name(f".{alp.name}.tmp")
                 temp_alp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
                 temp_alp.replace(alp)
 
-                cleanup_downstream_media(self.pdf, page, include_alignment=False)
+                self.paths.cleanup_downstream(page, include_alignment=False)
                 update_status('完了しました！', 1.0, current_page=page)
                 push_log(f'[ALIGN] 完了: 字幕・ポインタアライメントを保存しました')
                 await asyncio.sleep(0.3)
@@ -806,19 +788,72 @@ class SlideNarratorApp:
             dialog.close()
 
     async def save_alignment(self, page: int, rows: list[dict], align_data: dict) -> None:
-        if not self.pdf:
+        if not self.paths:
             return
-        alp = alignment_path(self.pdf, page)
+        alp = self.paths.alignment(page)
         align_data['alignments'] = rows
         temp_alp = alp.with_name(f".{alp.name}.tmp")
         temp_alp.write_text(json.dumps(align_data, ensure_ascii=False, indent=2), encoding='utf-8')
         temp_alp.replace(alp)
 
-        for f in [video_path(self.pdf, page), final_video_path(self.pdf), final_ja_srt_path(self.pdf), final_en_srt_path(self.pdf)]:
+        for f in [self.paths.video(page), self.paths.final_video, self.paths.final_ja_srt, self.paths.final_en_srt]:
             if f.exists():
                 f.unlink()
         ui.notify('字幕とポインタの修正を保存しました．', type='positive')
         await self.refresh_editor()
+
+    async def generate_slide_tts(self, page: int) -> None:
+        if not self.pdf or not self.paths:
+            return
+        txt_path = self.paths.explanation(page)
+        if not txt_path.exists() or not txt_path.read_text(encoding='utf-8').strip():
+            ui.notify(f'スライド {page} のナレーション原稿がありません．先に作成してください．', type='warning')
+            return
+        if self.processing:
+            ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
+            return
+
+        dialog, update_status, push_log = self.open_processing_dialog(f'スライド {page} の音声を合成中 ({self.lang_code})…')
+        self.set_processing(True)
+        self.current_task = asyncio.current_task()
+        try:
+            update_status(f'音声合成中…', 0.5, current_page=page)
+            push_log(f'[TTS] スライド {page} の音声合成を開始 (lang={self.lang_code})')
+            await asyncio.sleep(0.01)
+
+            tts_all = self.cfg.get('tts', {})
+            tts_cfg = tts_all.get(self.lang_code, tts_all)
+            out_mp3 = self.paths.audio(page)
+
+            await run.io_bound(
+                generate_tts,
+                text_path=txt_path,
+                out_path=out_mp3,
+                tts_cfg=tts_cfg,
+                filter_config_path=TTS_FILTER_PATH,
+                force=True,
+                lang=self.lang_code,
+            )
+
+            if not self.cancellation_requested:
+                for f in [self.paths.video(page), self.paths.final_video, self.paths.final_ja_srt, self.paths.final_en_srt]:
+                    if f.exists():
+                        f.unlink()
+
+                update_status('完了しました！', 1.0, current_page=page)
+                push_log(f'[TTS] スライド {page} の音声を保存しました: {out_mp3.name}')
+                await asyncio.sleep(0.3)
+                ui.notify(f'スライド {page} の音声を合成しました．', type='positive')
+                await self.refresh_editor()
+                await self.refresh_slide_videos()
+        except asyncio.CancelledError:
+            ui.notify('音声合成を中断しました．', type='warning')
+        except Exception as exc:
+            ui.notify(f'音声合成に失敗しました: {exc}', type='negative')
+        finally:
+            self.current_task = None
+            self.set_processing(False)
+            dialog.close()
 
     # ---- rendering ----------------------------------------------------
 
@@ -831,14 +866,14 @@ class SlideNarratorApp:
             return
         with self.gallery:
             with ui.row().classes('w-full items-center justify-between pb-2'):
-                ui.label(f'全 {len(self.images)} スライド（カードをクリックまたはチェックボックスで対象を切り替えられます）').classes('text-sm text-gray-500 dark:text-gray-400')
+                ui.label(f'全 {self.total_slides} スライド（カードをクリックまたはチェックボックスで対象を切り替えられます）').classes('text-sm text-gray-500 dark:text-gray-400')
                 with ui.row().classes('gap-2'):
                     ui.button('全スライドを選択', on_click=self.select_all_slides).props('dense outline size=sm')
                     ui.button('すべて解除', on_click=self.clear_all_slides).props('dense outline size=sm color=negative')
 
             with ui.grid(columns=5).classes('w-full gap-4'):
                 for n, img in enumerate(self.images, 1):
-                    is_active = n in self.active_pages
+                    is_active = n in self._selected_pages
                     card_classes = 'w-full cursor-pointer transition-all border p-3 rounded-lg gap-2 bg-zinc-800 border-zinc-700 shadow-sm '
                     img_classes = 'w-full rounded shadow-sm'
 
@@ -862,7 +897,7 @@ class SlideNarratorApp:
         if not self.simple_edit_container:
             return
         self.simple_edit_container.clear()
-        if not self.active_pages or not self.pdf:
+        if not self.active_pages or not self.pdf or not self.paths:
             with self.simple_edit_container:
                 ui.label('⚠ 処理対象となるスライドがありません．「スライドデッキ」タブで対象スライドを選択してください．').classes('text-orange-500 dark:text-orange-400')
             return
@@ -872,13 +907,12 @@ class SlideNarratorApp:
 
             with ui.column().classes('w-full gap-6'):
                 for p in self.active_pages:
-                    img_path = page_image_path(self.pdf, p)
-                    txt_path = explanation_path(self.pdf, p)
+                    img_path = self.paths.page_image(p)
+                    txt_path = self.paths.explanation(p)
                     curr_txt = txt_path.read_text(encoding='utf-8') if txt_path.exists() else ''
 
                     with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-800 rounded-lg shadow-sm'):
                         with ui.row().classes('w-full items-start gap-4 flex-nowrap'):
-                            # 左側: スライド画像プレビューおよび下部にスライド番号ラベル
                             with ui.column().classes('w-72 shrink-0 items-center gap-1.5'):
                                 if img_path.exists():
                                     ui.image(file_url(img_path)).classes('w-full rounded border border-zinc-700 shadow-sm')
@@ -886,7 +920,6 @@ class SlideNarratorApp:
                                     ui.label('（スライド画像なし）').classes('text-xs text-zinc-500')
                                 ui.label(f'スライド {p}').classes('text-sm font-bold text-zinc-300 self-center')
 
-                            # 右側: ナレーション原稿テキストフォーム＋下部ボタン列
                             with ui.column().classes('grow gap-2'):
                                 ta = ui.textarea(
                                     label=f'ナレーション原稿（スライド {p}）',
@@ -896,7 +929,6 @@ class SlideNarratorApp:
                                 )
                                 ta.props('input-style="height: 140px; resize: vertical;"')
 
-                                # テキスト下部のボタン列
                                 with ui.row().classes('w-full items-center justify-end gap-3 pt-1'):
                                     ui.button(
                                         '✨ ナレーションを再生成',
@@ -912,7 +944,7 @@ class SlideNarratorApp:
         if not self.edit_container:
             return
         self.edit_container.clear()
-        if not self.active_pages or not self.pdf:
+        if not self.active_pages or not self.pdf or not self.paths:
             with self.edit_container:
                 ui.label('⚠ 処理対象となるスライドがありません．「スライドデッキ」タブで対象スライドを選択してください．').classes('text-orange-500 dark:text-orange-400')
             return
@@ -920,14 +952,14 @@ class SlideNarratorApp:
         self.edit_page = page
         idx = self.active_pages.index(page)
         align_data, blocks, alignments = self.alignment_data(page)
-        img = page_image_path(self.pdf, page)
-        current_text_path = explanation_path(self.pdf, page)
+        img = self.paths.page_image(page)
+        current_text_path = self.paths.explanation(page)
         current_text = current_text_path.read_text(encoding='utf-8') if current_text_path.exists() else ''
 
         with self.edit_container:
             with ui.row().classes('w-full items-center gap-3 pb-2'):
                 sel = ui.select(
-                    {p: f'スライド {p} ({self.active_pages.index(p)+1} / {len(self.active_pages)} スライド)' for p in self.active_pages},
+                    {p: f'スライド {p} ({self.get_slide_order(p)} / {len(self.active_pages)} スライド)' for p in self.active_pages},
                     value=page,
                     label='編集スライド選択',
                 ).classes('min-w-[280px] max-w-[340px]').props('outlined dense')
@@ -937,20 +969,32 @@ class SlideNarratorApp:
                 ui.button('次のスライド ▶', on_click=self.next_edit).props(f'disable={idx == len(self.active_pages)-1} outlined')
 
             with ui.row().classes('w-full items-start gap-6'):
-                with ui.column().classes('w-5/12'):
+                with ui.column().classes('w-5/12 gap-3'):
                     if img.exists():
                         preview = draw_block_preview(img, blocks) if blocks else None
                         if preview is not None:
-                            preview_path = project_root(self.pdf) / 'pages' / f'{page:03d}_preview.png'
+                            preview_path = self.paths.page_preview(page)
                             preview.save(preview_path)
-                            ui.image(file_url(preview_path)).classes('w-full')
+                            ui.image(file_url(preview_path)).classes('w-full rounded border border-zinc-700 shadow-sm')
                         else:
-                            ui.image(file_url(img)).classes('w-full')
+                            ui.image(file_url(img)).classes('w-full rounded border border-zinc-700 shadow-sm')
                         ui.label(f'スライド {page}').classes('text-sm text-gray-500 dark:text-gray-400')
-                    ap = audio_path(self.pdf, page)
-                    if ap.exists():
-                        ui.label('🔊 生成済み音声プレビュー').classes('text-h6')
-                        ui.audio(file_url(ap)).classes('w-full')
+
+                    with ui.card().classes('w-full p-3 bg-zinc-900 border border-zinc-800 rounded-lg gap-2'):
+                        ui.label('🔊 ナレーション音声').classes('text-sm font-bold text-zinc-200')
+                        ap = self.paths.audio(page)
+                        if ap.exists():
+                            ui.audio(file_url(ap)).classes('w-full')
+                            ui.button(
+                                '🔄 このスライドの音声を再生成',
+                                on_click=lambda _, p=page: self.generate_slide_tts(p),
+                            ).props('dense outline size=sm').classes('w-full mt-1')
+                        else:
+                            ui.label('（音声未生成）').classes('text-xs text-zinc-500 py-1')
+                            ui.button(
+                                '🔊 このスライドの音声を生成',
+                                on_click=lambda _, p=page: self.generate_slide_tts(p),
+                            ).props('dense color=primary size=sm').classes('w-full')
 
                 with ui.column().classes('w-7/12'):
                     main_lang = '日本語' if self.lang_code == 'ja' else '英語'
@@ -1005,7 +1049,7 @@ class SlideNarratorApp:
         if not self.slide_video_gallery:
             return
         self.slide_video_gallery.clear()
-        if not self.pdf:
+        if not self.paths:
             with self.slide_video_gallery:
                 ui.label('プレゼンテーションPDFを選択してください．').classes('text-blue-500 dark:text-blue-400')
             return
@@ -1013,8 +1057,8 @@ class SlideNarratorApp:
         with self.slide_video_gallery:
             with ui.grid(columns=4).classes('w-full gap-4'):
                 for p in self.active_pages:
-                    vp = video_path(self.pdf, p)
-                    img = page_image_path(self.pdf, p)
+                    vp = self.paths.video(p)
+                    img = self.paths.page_image(p)
                     with ui.card().classes('w-full p-3 gap-2 rounded-lg bg-zinc-800 border border-zinc-700 shadow-sm'):
                         if vp.exists():
                             ui.video(file_url(vp)).classes('w-full rounded shadow-sm')
@@ -1022,19 +1066,18 @@ class SlideNarratorApp:
                             if img.exists():
                                 ui.image(file_url(img)).classes('w-full opacity-60 rounded shadow-sm')
                             ui.label('（単体動画 未生成）').classes('text-xs text-orange-400 font-medium')
-                        # スライド番号ラベルをビデオ／画像の下側に配置
                         ui.label(f'スライド {p}').classes('text-sm font-bold text-white self-center pt-1')
 
     async def refresh_final_video(self) -> None:
         if not self.final_video_container:
             return
         self.final_video_container.clear()
-        if not self.pdf:
+        if not self.paths:
             with self.final_video_container:
                 ui.label('PDFを選択してください．').classes('text-xs text-zinc-500')
             return
 
-        final = final_video_path(self.pdf)
+        final = self.paths.final_video
 
         with self.final_video_container:
             if final.exists():
@@ -1067,7 +1110,6 @@ class SlideNarratorApp:
                 llm_model = ui.input('LLM Model', value=llm.get('model', '')).classes('grow')
                 llm_temp = ui.number('Temperature', value=float(llm.get('temperature', 0.3)), min=0, max=2, step=0.1).classes('w-40')
 
-            # LLM 接続テストエリア
             with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-700 rounded-lg gap-2 mt-1'):
                 ui.label('🧪 LLM 接続テスト（シングルターン会話）').classes('text-sm font-bold text-zinc-200')
                 with ui.row().classes('w-full items-center gap-2'):
@@ -1127,7 +1169,6 @@ class SlideNarratorApp:
                 ja_model = ui.input('日本語 Model', value=ja.get('model', '')).classes('grow')
                 ja_voice = ui.input('日本語 Voice', value=ja.get('voice', '')).classes('grow')
 
-            # 日本語 TTS 接続テストエリア
             with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-700 rounded-lg gap-2 mt-1'):
                 ui.label('🧪 日本語 TTS 接続・音声再生テスト').classes('text-sm font-bold text-zinc-200')
                 with ui.row().classes('w-full items-center gap-2'):
@@ -1196,7 +1237,6 @@ class SlideNarratorApp:
                 en_model = ui.input('英語 Model', value=en.get('model', '')).classes('grow')
                 en_voice = ui.input('英語 Voice', value=en.get('voice', '')).classes('grow')
 
-            # 英語 TTS 接続テストエリア
             with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-700 rounded-lg gap-2 mt-1'):
                 ui.label('🧪 英語 TTS 接続・音声再生テスト').classes('text-sm font-bold text-zinc-200')
                 with ui.row().classes('w-full items-center gap-2'):
@@ -1315,18 +1355,13 @@ class SlideNarratorApp:
     # ---- global refresh ----------------------------------------------
 
     async def refresh_all(self) -> None:
-        self.recalculate_pages()
-        await self.refresh_gallery()
-        await self.refresh_simple_editor()
-        await self.refresh_editor()
-        await self.refresh_slide_videos()
+        await self.refresh_views()
         await self.refresh_final_video()
 
     # ---- UI -----------------------------------------------------------
 
     def build(self) -> None:
         ui.page_title('Slide Narrator')
-        # ダークテーマに固定
         ui.dark_mode().enable()
         ui.colors(primary='#3b82f6')
 
@@ -1419,7 +1454,6 @@ class SlideNarratorApp:
                             self.history_log_widget.push(line)
 
         self.refresh_settings()
-        self.recalculate_pages()
 
     def _mode_changed(self, value: str) -> None:
         self.mode_code = value
@@ -1432,14 +1466,11 @@ class SlideNarratorApp:
         asyncio.create_task(self.refresh_editor())
 
     def _range_changed(self) -> None:
-        self.pages_spec = self.pages_input.value or ''
+        new_val = self.pages_input.value or ''
+        if new_val == self.pages_spec:
+            return
         try:
-            self.recalculate_pages()
-            self.save_project_settings()
-            asyncio.create_task(self.refresh_gallery())
-            asyncio.create_task(self.refresh_simple_editor())
-            asyncio.create_task(self.refresh_editor())
-            asyncio.create_task(self.refresh_slide_videos())
+            self.apply_pages_spec(new_val, save_and_refresh=True)
         except Exception as exc:
             ui.notify(f'スライド範囲を解釈できません: {exc}', type='negative')
 

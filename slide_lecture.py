@@ -924,6 +924,69 @@ Return ONLY the raw narration text.
     return response.choices[0].message.content.strip()
 
 
+def generate_single_explanation(
+    client: OpenAI,
+    cfg: dict,
+    pdf: Path,
+    images: list[Path],
+    out_dir: Path,
+    page: int,
+    active_pages: list[int] | None = None,
+    mode: str = "lecture",
+    lang: str = "ja",
+) -> str:
+    """単一スライドのナレーション原稿を前後の文脈を考慮して生成・保存します．"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    page_texts = extract_page_text(pdf)
+
+    # 概要の取得または構築
+    overview_path = out_dir / "_course_overview.txt"
+    if overview_path.exists():
+        overview = overview_path.read_text(encoding="utf-8")
+    else:
+        overview = build_course_overview(client, cfg, page_texts, mode=mode, lang=lang)
+        atomic_write_text(overview_path, overview + "\n")
+
+    pages_list = active_pages if active_pages is not None else list(range(1, len(images) + 1))
+    cur_idx = pages_list.index(page) if page in pages_list else 0
+
+    prev_p = pages_list[cur_idx - 1] if cur_idx > 0 else None
+    next_p = pages_list[cur_idx + 1] if cur_idx + 1 < len(pages_list) else None
+
+    prev_text = page_texts[prev_p - 1] if prev_p is not None else None
+    next_text = page_texts[next_p - 1] if next_p is not None else None
+
+    prev_exp_file = out_dir / f"{prev_p:03d}.txt" if prev_p else None
+    prev_explanation = (
+        prev_exp_file.read_text(encoding="utf-8").strip()
+        if prev_exp_file and prev_exp_file.exists()
+        else ""
+    )
+
+    image_path = images[page - 1]
+    new_text = make_explanation(
+        client=client,
+        cfg=cfg,
+        image=image_path,
+        current_page=page,
+        current_text=page_texts[page - 1],
+        prev_page=prev_p,
+        prev_text=prev_text,
+        next_page=next_p,
+        next_text=next_text,
+        previous_explanation=prev_explanation,
+        course_overview=overview,
+        total_active=len(pages_list),
+        active_idx=cur_idx,
+        mode=mode,
+        lang=lang,
+    )
+
+    out_file = out_dir / f"{page:03d}.txt"
+    atomic_write_text(out_file, new_text + "\n")
+    return new_text
+
+
 def generate_single_alignment(
     client: OpenAI,
     cfg: dict,
