@@ -1243,6 +1243,7 @@ def generate_page_video(
         if not schedule:
             cmd = [
                 "ffmpeg", "-y",
+                "-loglevel", "error",
                 "-loop", "1",
                 "-i", str(image),
                 "-i", str(audio),
@@ -1283,6 +1284,7 @@ def generate_page_video(
 
             cmd = [
                 "ffmpeg", "-y",
+                "-loglevel", "error",
                 "-loop", "1", "-i", str(image),
                 "-loop", "1", "-i", str(laser_img),
                 "-i", str(audio),
@@ -1358,6 +1360,7 @@ def concat_videos(
 
     cmd = [
         "ffmpeg", "-y",
+        "-loglevel", "error",
         "-f", "concat",
         "-safe", "0",
         "-i", str(list_file),
