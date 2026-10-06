@@ -12,12 +12,17 @@ Turn your PDF presentation slides into narrated lecture videos with AI.
  - レーザポインタ風マーカーでどこを話しているかをポイントしますので，ある程度は視聴者の視線を誘導できます．プログラムコードやベクター系の図であれば部分的にポイントはできます（期待は厳禁）．
  - AIが生成したナレーションが気に入らない場合は，直接手で編集できます．
  - 日本語TTSが正しくナレーションできるように，ユーザ辞書とLLMを使って一部のテキストをカタカナ表記にフィルタリングしています．
- - 全ての処理をローカル環境で済ませることが可能です（OpenAI互換APIをもったLLM/TTSサーバをローカルで稼働させてください）．以下は私が使っている環境です．
-   - (1) LLMサーバ: ollama ( https://ollama.com/ )
-     - LLMは"Qwen3.8-27b ( https://huggingface.co/Qwen/Qwen3.8-27B )
-   - (2) 英語TTSサーバ: remskyさんの https://github.com/remsky/Kokoro-FastAPI 
-   - (3) 日本語TTSサーバ: Aratakoさんの https://github.com/Aratako/Irodori-TTS-Server
-     - 参照音声としてはhadouさんの　https://huggingface.co/datasets/hadou1225/Hadou-Voice-Dataset
+ - 全ての処理をローカル環境で済ませることが可能です（OpenAI互換APIをもったLLM/TTSサーバをローカルで稼働させてください）．
+   - 参考まで以下は私が使っている環境です．
+     - (1) LLMサーバ: ollama ( https://ollama.com/ )
+       - LLMは"Qwen3.8-27b ( https://huggingface.co/Qwen/Qwen3.8-27B )
+       - Nvidia GeForce RTX5090 で稼働
+     - (2) 日本語TTSサーバ: Aratakoさんの https://github.com/Aratako/Irodori-TTS-Server
+       - 参照音声としてはhadouさんの　https://huggingface.co/datasets/hadou1225/Hadou-Voice-Dataset
+       - Nvidia GeForce RTX5070Ti で稼働
+     - (3) 英語TTSサーバ: remskyさんの https://github.com/remsky/Kokoro-FastAPI
+       - これは負荷が軽いのでCPUで稼働
+   - 実行は遅いかもしれませんが，DGX Spark が1台あれば十分動かせると思います． 
        
 ![img](2026-10-05_21-09.png)
 
