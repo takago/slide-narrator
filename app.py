@@ -411,11 +411,11 @@ class SlideNarratorApp:
         with dialog, ui.card().classes('items-center p-6 gap-3 min-w-[620px] max-w-[760px]'):
             ui.spinner(size='lg')
             title_label = ui.label(initial_title).classes('text-base font-bold text-center text-zinc-100')
-            status_label = ui.label('準備中…').classes('text-sm text-zinc-400 text-center')
 
             with ui.row().classes('w-full items-center gap-2'):
                 progress_bar = ui.linear_progress(value=0.0, show_value=False).props('rounded size=14px').classes('grow')
-                percent_label = ui.label('0%').classes('text-xs font-mono font-bold w-12 text-right text-zinc-300')
+
+            status_label = ui.label('準備中…').classes('text-sm text-zinc-400 text-center')
 
             slide_preview_row = ui.row().classes('w-full items-end justify-center gap-3 py-2')
             with slide_preview_row:
@@ -477,12 +477,9 @@ class SlideNarratorApp:
             status_label.text = text
             if frac is None:
                 progress_bar.value = 0.0
-                percent_label.text = '--'
             else:
                 clamped = max(0.0, min(1.0, float(frac)))
                 progress_bar.value = clamped
-                percent = int(round(clamped * 100))
-                percent_label.text = f'{percent}%'
 
             if current_page is not None:
                 update_slide_preview(current_page)
@@ -1782,9 +1779,9 @@ class SlideNarratorApp:
             self.force_checkbox.on_value_change(lambda e: setattr(self, 'force_run', bool(e.value)))
             self.pipeline_buttons = [
                 ui.button('① ナレーション原稿の生成', on_click=lambda: self.pipeline('explain', '① ナレーション原稿を作成中…')).classes('w-full'),
-                ui.button('② 翻訳，字幕生成，ポインタの配置', on_click=lambda: self.pipeline('align', '② 翻訳と字幕，ポインタ配置を決定中…')).classes('w-full'),
-                ui.button('③ 音声の合成', on_click=lambda: self.pipeline('tts', f'③ ナレーション音声を合成中…')).classes('w-full'),
-                ui.button('④ 動画の生成', on_click=lambda: self.pipeline('video', '④ 動画を生成中…')).classes('w-full'),
+                ui.button('② 翻訳，字幕生成，ポインタ配置', on_click=lambda: self.pipeline('align', '② 翻訳と字幕，ポインタ配置を決定中…')).classes('w-full'),
+                ui.button('③ ナレーション音声の作成', on_click=lambda: self.pipeline('tts', f'③ ナレーション音声を作成成中…')).classes('w-full'),
+                ui.button('④ ナレーションビデオの作成', on_click=lambda: self.pipeline('video', '④ ナレーションビデオを作成中…')).classes('w-full'),
             ]
             ui.separator()
             ui.label('🎬 完成ビデオ').classes('text-subtitle1 font-bold text-zinc-200')
