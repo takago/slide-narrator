@@ -409,14 +409,10 @@ class SlideNarratorApp:
         self.cancellation_requested = False
 
         with dialog, ui.card().classes('items-center p-6 gap-3 min-w-[620px] max-w-[760px]'):
-            ui.spinner(size='lg')
+            # 1. 見出し
             title_label = ui.label(initial_title).classes('text-base font-bold text-center text-zinc-100')
 
-            with ui.row().classes('w-full items-center gap-2'):
-                progress_bar = ui.linear_progress(value=0.0, show_value=False).props('rounded size=14px').classes('grow')
-
-            status_label = ui.label('準備中…').classes('text-sm text-zinc-400 text-center')
-
+            # 2. スライド画像
             slide_preview_row = ui.row().classes('w-full items-end justify-center gap-3 py-2')
             with slide_preview_row:
                 with ui.column().classes('items-center w-28 opacity-45'):
@@ -437,9 +433,21 @@ class SlideNarratorApp:
                         next_image = ui.image('').props('fit=contain').classes('w-full h-full rounded').style('display: none')
                         next_placeholder = ui.label('-').classes('text-xs text-zinc-500')
 
+            # 3. ラベル
+            status_label = ui.label('準備中…').classes('text-sm text-zinc-400 text-center')
+
+            # 4. 進捗バー
+            with ui.row().classes('w-full items-center gap-2'):
+                progress_bar = ui.linear_progress(value=0.0, show_value=False).props('rounded size=14px').classes('grow')
+
+            # 5. ログフォールド
             with ui.expansion('詳細ログを表示', icon='terminal').classes('w-full border border-zinc-700 rounded-lg text-xs mt-1'):
                 dialog_log = ui.log(max_lines=300).classes('w-full h-40 font-mono text-xs bg-zinc-900 text-zinc-300 p-2')
 
+            # 6. スピナー
+            ui.spinner(size='md')
+
+            # 7. 中断ボタン
             with ui.row().classes('w-full justify-center pt-2'):
                 ui.button('処理を中断', on_click=self.request_cancel, color='negative').props('text-color=white')
 
@@ -1849,3 +1857,4 @@ application = SlideNarratorApp()
 application.build()
 
 ui.run(title='Slide Narrator', reload=False)
+# ui.run(title='Slide Narrator', reload=False, show=False, port=17171,host='0.0.0.0')
