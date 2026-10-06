@@ -154,6 +154,19 @@ Return ONLY a JSON array of translated strings matching the order and length of 
 # ファイルシステム／アトミック書き出し用ヘルパー
 # =====================================================================
 
+def emit_progress(phase: str, current: int, total: int, page: int | None = None, message: str = "", reused: bool = False) -> None:
+    """GUIおよび外部プロセス向けの構造化進捗イベントを出力します．"""
+    payload = {
+        "phase": phase,
+        "current": current,
+        "total": total,
+        "page": page,
+        "message": message,
+        "reused": reused,
+    }
+    print(f"[PROGRESS] {json.dumps(payload, ensure_ascii=False)}", flush=True)
+
+
 def atomic_write_text(target: Path, text: str, encoding: str = "utf-8") -> None:
     """一時ファイルを経由してアトミックにテキストを書き出します．"""
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -190,7 +203,6 @@ def detect_best_video_encoder() -> tuple[str, list[str]]:
     except Exception:
         return "libx264", ["-preset", "ultrafast"]
 
-    # 1. NVIDIA NVENC (NVENCの最小対応サイズを満たすため128x128でテスト)
     if "h264_nvenc" in encoders:
         test_cmd = [
             "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=128x128:d=0.1",
@@ -200,7 +212,6 @@ def detect_best_video_encoder() -> tuple[str, list[str]]:
             print("[ENCODER] ハードウェアアクセラレーション: NVIDIA NVENC を使用します．")
             return "h264_nvenc", ["-preset", "p1"]
 
-    # 2. Apple Silicon / macOS VideoToolbox
     if "h264_videotoolbox" in encoders:
         test_cmd = [
             "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=128x128:d=0.1",
@@ -210,7 +221,6 @@ def detect_best_video_encoder() -> tuple[str, list[str]]:
             print("[ENCODER] ハードウェアアクセラレーション: Apple VideoToolbox を使用します．")
             return "h264_videotoolbox", ["-realtime", "1"]
 
-    # 3. Intel QSV
     if "h264_qsv" in encoders:
         test_cmd = [
             "ffmpeg", "-v", "error", "-f", "lavfi", "-i", "nullsrc=s=128x128:d=0.1",
@@ -220,7 +230,6 @@ def detect_best_video_encoder() -> tuple[str, list[str]]:
             print("[ENCODER] ハードウェアアクセラレーション: Intel Quick Sync Video (QSV) を使用します．")
             return "h264_qsv", ["-preset", "veryfast"]
 
-    # 4. CPU (libx264)
     print("[ENCODER] ソフトウェアエンコード: libx264 (ultrafast) を使用します．")
     return "libx264", ["-preset", "ultrafast"]
 
@@ -939,7 +948,6 @@ def generate_single_explanation(
     out_dir.mkdir(parents=True, exist_ok=True)
     page_texts = extract_page_text(pdf)
 
-    # 概要の取得または構築
     overview_path = out_dir / "_course_overview.txt"
     if overview_path.exists():
         overview = overview_path.read_text(encoding="utf-8")
@@ -1020,6 +1028,46 @@ def generate_single_alignment(
     }
 
 
+def generate_single_tts(
+    text_path: Path,
+    out_path: Path,
+    tts_cfg: dict,
+    filter_config_path: Path,
+    force: bool,
+    lang: str = "ja",
+) -> None:
+    """単一スライドの音声をTTSエンジンで合成・保存します．"""
+    generate_tts(
+        text_path=text_path,
+        out_path=out_path,
+        tts_cfg=tts_cfg,
+        filter_config_path=filter_config_path,
+        force=force,
+        lang=lang,
+    )
+
+
+def generate_single_page_video(
+    image: Path,
+    audio: Path,
+    out: Path,
+    schedule: list[dict],
+    laser_img: Path,
+    video_cfg: dict,
+    force: bool,
+) -> None:
+    """単一スライドの動画をレンダリングします．"""
+    generate_page_video(
+        image=image,
+        audio=audio,
+        out=out,
+        schedule=schedule,
+        laser_img=laser_img,
+        cfg=video_cfg,
+        force=force,
+    )
+
+
 def generate_explanations(
     pdf: Path,
     images: list[Path],
@@ -1060,9 +1108,11 @@ def generate_explanations(
 
         if out.exists() and not force:
             previous_explanation = out.read_text(encoding="utf-8").strip()
+            emit_progress("explain", k + 1, len(active_indices), page=i, message=f"スライド {i}（{k + 1}/{len(active_indices)}）", reused=True)
             print(f"[LLM] reuse narration {out}")
             continue
 
+        emit_progress("explain", k + 1, len(active_indices), page=i, message=f"スライド {i}（{k + 1}/{len(active_indices)}）")
         print(f"[LLM] ナレーション生成: page {i}/{len(images)} ({k + 1}/{len(active_indices)}) (mode={mode}, lang={lang})")
 
         text = make_explanation(
@@ -1104,7 +1154,7 @@ def generate_alignments(
         if active_pages is None or (idx + 1) in active_pages
     ]
 
-    for i_idx in active_indices:
+    for k, i_idx in enumerate(active_indices, 1):
         i = i_idx + 1
         image = images[i_idx]
         text_file = out_dir / f"{i:03d}.txt"
@@ -1114,9 +1164,11 @@ def generate_alignments(
             continue
 
         if align_out.exists() and not force:
+            emit_progress("align", k, len(active_indices), page=i, message=f"スライド {i}（{k}/{len(active_indices)}）", reused=True)
             print(f"[ALIGN] reuse {align_out}")
             continue
 
+        emit_progress("align", k, len(active_indices), page=i, message=f"スライド {i}（{k}/{len(active_indices)}）")
         print(f"[ALIGN] 字幕＆ポインタ解析: page {i}/{len(images)}")
         raw_text = text_file.read_text(encoding="utf-8").strip()
         align_data = generate_single_alignment(client, cfg, pdf, i, image, raw_text, dpi, lang)
@@ -1502,6 +1554,7 @@ def main() -> int:
         text_file = explanations / f"{page_num:03d}.txt"
         mp3 = audio / f"{page_num:03d}.mp3"
         if text_file.exists():
+            emit_progress("tts", k, len(sorted_active_pages), page=page_num, message=f"スライド {page_num}（{k}/{len(sorted_active_pages)}）")
             print(f"[TTS] 音声合成中: page {page_num} ({k}/{len(sorted_active_pages)})")
             generate_tts(text_file, mp3, tts_cfg, filter_config_path, args.force, lang=lang)
 
@@ -1528,6 +1581,7 @@ def main() -> int:
         if not mp3_file.exists() or not image.exists():
             continue
 
+        emit_progress("video", k, len(sorted_active_pages), page=page_num, message=f"スライド {page_num}（{k}/{len(sorted_active_pages)}）")
         print(f"[VIDEO] スライド動画生成中: page {page_num} ({k}/{len(sorted_active_pages)})")
 
         schedule = []
@@ -1558,6 +1612,7 @@ def main() -> int:
         videos.append(out)
         video_slide_indices.append(page_num)
 
+    emit_progress("concat", len(videos), len(videos), message="完成動画を結合・生成中…")
     final_ja_srt = root / f"{args.pdf.stem}_ja.srt"
     create_full_srt(all_page_subtitles, final_ja_srt, lang="ja")
 

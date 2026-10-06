@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -23,6 +22,8 @@ from slide_lecture import (
     extract_page_text,
     generate_single_alignment,
     generate_single_explanation,
+    generate_single_tts,
+    generate_single_page_video,
     generate_tts,
     load_project_json,
     make_client,
@@ -540,6 +541,14 @@ class SlideNarratorApp:
         env = os.environ.copy()
         env['PYTHONUNBUFFERED'] = '1'
 
+        phase_titles = {
+            'explain': '① ナレーション原稿を作成中…',
+            'align': '② 字幕・ポインタを解析中…',
+            'tts': f'③ 音声を合成中 ({self.lang_code})…',
+            'video': '④ スライド動画をレンダリング中…',
+            'concat': '④ 完成動画を結合・生成中…',
+        }
+
         try:
             update_status('処理を開始しています…', 0.0, current_page=self.active_pages[0])
             await asyncio.sleep(0.05)
@@ -569,65 +578,30 @@ class SlideNarratorApp:
                 if self.history_log_widget:
                     self.history_log_widget.push(line)
 
-                if '[LLM] ナレーション生成:' in line:
-                    m_p = re.search(r'page (\d+)/', line)
-                    m_frac = re.search(r'\((\d+)/(\d+)\)', line)
-                    if m_p and m_frac:
-                        p_num = int(m_p.group(1))
-                        cur, tot = int(m_frac.group(1)), int(m_frac.group(2))
-                        update_status(f'スライド {cur} / {tot}', cur / tot, title='① ナレーション原稿を作成中…', current_page=p_num)
+                # 構造化進捗イベント [PROGRESS] のみで確実にUI更新
+                if line.startswith('[PROGRESS]'):
+                    try:
+                        p_data = json.loads(line[10:].strip())
+                        phase = p_data.get('phase')
+                        cur = p_data.get('current', 1)
+                        tot = p_data.get('total', total_active_slides)
+                        p_num = p_data.get('page')
+                        msg = p_data.get('message', '')
 
-                elif '[LLM] reuse narration' in line:
-                    m = re.search(r'(\d{3})\.txt', line)
-                    if m:
-                        p_num = int(m.group(1))
-                        idx = self.get_slide_order(p_num) or 1
-                        update_status(f'既存原稿を再利用: スライド {p_num} ({idx}/{total_active_slides})', idx / total_active_slides, title='① ナレーション原稿を確認中…', current_page=p_num)
+                        title = phase_titles.get(phase, initial_title)
+                        weight = 0.9 if phase == 'video' else 1.0
+                        frac = (cur / max(1, tot)) * weight if tot else 0.5
+                        if phase == 'concat':
+                            frac = 0.95
+                            status_label_text = msg or '完成動画を結合・生成中…'
+                        elif p_num is not None:
+                            status_label_text = f'スライド {p_num}（{cur}/{tot}）'
+                        else:
+                            status_label_text = msg or f'スライド {cur}（{cur}/{tot}）'
 
-                elif '[ALIGN] 字幕＆ポインタ解析:' in line:
-                    m = re.search(r'page (\d+)/', line)
-                    if m:
-                        p_num = int(m.group(1))
-                        idx = self.get_slide_order(p_num) or 1
-                        update_status(f'スライド {p_num} ({idx}/{total_active_slides})', idx / total_active_slides, title='② 字幕・ポインタを解析中…', current_page=p_num)
-
-                elif '[ALIGN] reuse' in line:
-                    m = re.search(r'(\d{3})_align\.json', line)
-                    if m:
-                        p_num = int(m.group(1))
-                        idx = self.get_slide_order(p_num) or 1
-                        update_status(f'既存データを再利用: スライド {p_num} ({idx}/{total_active_slides})', idx / total_active_slides, title='② 字幕・ポインタを確認中…', current_page=p_num)
-
-                elif '[TTS] 音声合成中:' in line or '[TTS' in line:
-                    m_page = re.search(r'page (\d+)', line) or re.search(r'(\d{3})\.mp3', line)
-                    m_prog = re.search(r'\((\d+)/(\d+)\)', line)
-                    p_num = int(m_page.group(1)) if m_page else None
-                    if m_prog:
-                        cur, tot = int(m_prog.group(1)), int(m_prog.group(2))
-                        update_status(f'スライド ({cur}/{tot})', cur / tot, title=f'③ 音声を合成中 ({self.lang_code})…', current_page=p_num)
-                    elif p_num:
-                        idx = self.get_slide_order(p_num) or 1
-                        action = '既存音声を再利用' if 'reuse' in line else '音声合成完了'
-                        update_status(f'{action}: スライド {p_num} ({idx}/{total_active_slides})', idx / total_active_slides, title=f'③ 音声を合成中 ({self.lang_code})…', current_page=p_num)
-
-                elif '[VIDEO] スライド動画生成中:' in line or '[VIDEO]' in line:
-                    weight = 0.85 if stage == 'video' else 1.0
-                    m_page = re.search(r'page (\d+)', line) or re.search(r'(\d{3})\.mp4', line)
-                    m_prog = re.search(r'\((\d+)/(\d+)\)', line)
-                    p_num = int(m_page.group(1)) if m_page else None
-
-                    if m_prog:
-                        cur, tot = int(m_prog.group(1)), int(m_prog.group(2))
-                        frac = (cur / tot) * weight
-                        update_status(f'スライド ({cur}/{tot})', frac, title='④ スライド動画をレンダリング中…', current_page=p_num)
-                    elif p_num:
-                        idx = self.get_slide_order(p_num) or 1
-                        frac = (idx / total_active_slides) * weight
-                        action = '既存動画を再利用' if 'reuse' in line else 'レンダリング完了'
-                        update_status(f'{action}: スライド {p_num} ({idx}/{total_active_slides})', frac, title='④ スライド動画をレンダリング中…', current_page=p_num)
-
-                elif '[CONCAT]' in line or 'concat' in line.lower():
-                    update_status('全スライド動画の結合＆字幕トラック埋め込み中…', 0.92, title='④ 完成動画を結合・生成中…')
+                        update_status(status_label_text, frac, title=title, current_page=p_num)
+                    except Exception:
+                        pass
 
                 await asyncio.sleep(0.01)
 
@@ -705,7 +679,6 @@ class SlideNarratorApp:
             push_log(f'[REGEN] LLM推論中...')
             await asyncio.sleep(0.01)
 
-            # slide_lecture.py 側の統一ロジックを呼び出し
             new_narration = await run.io_bound(
                 generate_single_explanation,
                 client=client,
@@ -826,7 +799,7 @@ class SlideNarratorApp:
             out_mp3 = self.paths.audio(page)
 
             await run.io_bound(
-                generate_tts,
+                generate_single_tts,
                 text_path=txt_path,
                 out_path=out_mp3,
                 tts_cfg=tts_cfg,
@@ -1091,212 +1064,272 @@ class SlideNarratorApp:
             else:
                 ui.label('動画未生成').classes('text-xs text-zinc-500')
 
-    # ---- settings -----------------------------------------------------
+    # ---- settings (modularized) ---------------------------------------
+
+    def _build_llm_settings(self) -> tuple[ui.input, ui.input, ui.number]:
+        """LLM設定UIおよび接続テストを構築します"""
+        ui.label('LLM 設定 (`config.yaml`)').classes('text-h5')
+        llm = self.cfg.setdefault('llm', {})
+        with ui.row().classes('w-full'):
+            llm_base = ui.input('LLM Base URL', value=llm.get('base_url', '')).classes('grow')
+            llm_model = ui.input('LLM Model', value=llm.get('model', '')).classes('grow')
+            llm_temp = ui.number('Temperature', value=float(llm.get('temperature', 0.3)), min=0, max=2, step=0.1).classes('w-40')
+
+        with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-700 rounded-lg gap-2 mt-1'):
+            ui.label('🧪 LLM 接続テスト（シングルターン会話）').classes('text-sm font-bold text-zinc-200')
+            with ui.row().classes('w-full items-center gap-2'):
+                llm_test_input = ui.input(
+                    'テストプロンプト',
+                    value='こんにちは！自己紹介を1文でしてください．',
+                ).props('dense outlined').classes('grow')
+                llm_test_btn = ui.button('💬 LLM 接続テスト送信').props('dense outline')
+
+            llm_test_result = ui.label('').classes('text-xs text-zinc-300 font-mono p-2 bg-zinc-800 rounded min-h-[36px] w-full whitespace-pre-wrap')
+
+            async def run_llm_test() -> None:
+                prompt = (llm_test_input.value or '').strip()
+                if not prompt:
+                    ui.notify('プロンプトを入力してください．', type='warning')
+                    return
+                if not llm_base.value or not llm_model.value:
+                    ui.notify('Base URL と Model を入力してください．', type='warning')
+                    return
+
+                llm_test_btn.disable()
+                llm_test_result.text = 'LLMにリクエスト中…'
+                try:
+                    test_cfg = {
+                        'base_url': llm_base.value.strip(),
+                        'api_key': llm.get('api_key', 'dummy'),
+                    }
+                    client = await run.io_bound(make_client, test_cfg)
+
+                    def call_llm() -> str:
+                        res = client.chat.completions.create(
+                            model=llm_model.value.strip(),
+                            temperature=float(llm_temp.value or 0.3),
+                            max_tokens=1000,
+                            messages=[{'role': 'user', 'content': prompt}],
+                        )
+                        return res.choices[0].message.content or '（空の応答でした）'
+
+                    answer = await run.io_bound(call_llm)
+                    llm_test_result.text = answer
+                    ui.notify('LLMからの応答を受信しました．', type='positive')
+                except Exception as err:
+                    llm_test_result.text = f'【エラー】\n{err}'
+                    ui.notify(f'LLM接続テストに失敗しました: {err}', type='negative')
+                finally:
+                    llm_test_btn.enable()
+
+            llm_test_btn.on_click(run_llm_test)
+
+        return llm_base, llm_model, llm_temp
+
+    def _build_tts_settings(self) -> tuple[tuple[ui.input, ui.input, ui.input], tuple[ui.input, ui.input, ui.input]]:
+        """日英TTS設定UIおよび音声再生テストを構築します"""
+        tts = self.cfg.setdefault('tts', {})
+        ja = tts.setdefault('ja', {})
+        en = tts.setdefault('en', {})
+
+        # --- 日本語 TTS ---
+        ui.separator().classes('my-4')
+        ui.label('🇯🇵 日本語 TTS 設定 (`config.yaml: tts.ja`)').classes('text-h5')
+        with ui.row().classes('w-full'):
+            ja_base = ui.input('日本語 Base URL', value=ja.get('base_url', '')).classes('grow')
+            ja_model = ui.input('日本語 Model', value=ja.get('model', '')).classes('grow')
+            ja_voice = ui.input('日本語 Voice', value=ja.get('voice', '')).classes('grow')
+
+        with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-700 rounded-lg gap-2 mt-1'):
+            ui.label('🧪 日本語 TTS 接続・音声再生テスト').classes('text-sm font-bold text-zinc-200')
+            with ui.row().classes('w-full items-center gap-2'):
+                ja_test_text = ui.input(
+                    '読み上げテキスト',
+                    value='こんにちは。日本語の音声合成テストです。正常に聞こえますか？',
+                ).props('dense outlined').classes('grow')
+                ja_test_btn = ui.button('🔊 音声を生成・再生').props('dense outline')
+
+            ja_audio_container = ui.column().classes('w-full')
+
+            async def run_ja_tts_test() -> None:
+                txt = (ja_test_text.value or '').strip()
+                if not txt:
+                    ui.notify('読み上げテキストを入力してください．', type='warning')
+                    return
+                if not ja_base.value or not ja_model.value or not ja_voice.value:
+                    ui.notify('日本語 TTS の Base URL, Model, Voice を指定してください．', type='warning')
+                    return
+
+                ja_test_btn.disable()
+                ja_audio_container.clear()
+                with ja_audio_container:
+                    ui.label('音声を合成中…').classes('text-xs text-zinc-400')
+                try:
+                    tts_cfg = {
+                        'base_url': ja_base.value.strip(),
+                        'api_key': 'dummy',
+                        'model': ja_model.value.strip(),
+                        'voice': ja_voice.value.strip(),
+                        'response_format': 'mp3',
+                    }
+                    out_path = TEST_AUDIO_DIR / 'test_ja.mp3'
+
+                    def call_tts():
+                        cl = make_client(tts_cfg)
+                        resp = cl.audio.speech.create(
+                            model=tts_cfg['model'],
+                            voice=tts_cfg['voice'],
+                            input=txt,
+                            response_format='mp3',
+                        )
+                        resp.write_to_file(out_path)
+
+                    await run.io_bound(call_tts)
+                    ja_audio_container.clear()
+                    with ja_audio_container:
+                        ui.audio(file_url(out_path)).props('autoplay').classes('w-full max-w-lg mt-1')
+                    ui.notify('日本語音声を合成しました．', type='positive')
+                except Exception as err:
+                    ja_audio_container.clear()
+                    with ja_audio_container:
+                        ui.label(f'【TTS合成失敗】: {err}').classes('text-xs text-red-400')
+                    ui.notify(f'日本語 TTS テストに失敗しました: {err}', type='negative')
+                finally:
+                    ja_test_btn.enable()
+
+            ja_test_btn.on_click(run_ja_tts_test)
+
+        # --- 英語 TTS ---
+        ui.separator().classes('my-4')
+        ui.label('🇺🇸 英語 TTS 設定 (`config.yaml: tts.en`)').classes('text-h5')
+        with ui.row().classes('w-full'):
+            en_base = ui.input('英語 Base URL', value=en.get('base_url', '')).classes('grow')
+            en_model = ui.input('英語 Model', value=en.get('model', '')).classes('grow')
+            en_voice = ui.input('英語 Voice', value=en.get('voice', '')).classes('grow')
+
+        with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-700 rounded-lg gap-2 mt-1'):
+            ui.label('🧪 英語 TTS 接続・音声再生テスト').classes('text-sm font-bold text-zinc-200')
+            with ui.row().classes('w-full items-center gap-2'):
+                en_test_text = ui.input(
+                    '読み上げテキスト (English)',
+                    value='Hello! This is a test for English text-to-speech synthesis.',
+                ).props('dense outlined').classes('grow')
+                en_test_btn = ui.button('🔊 音声を生成・再生').props('dense outline')
+
+            en_audio_container = ui.column().classes('w-full')
+
+            async def run_en_tts_test() -> None:
+                txt = (en_test_text.value or '').strip()
+                if not txt:
+                    ui.notify('Text is required.', type='warning')
+                    return
+                if not en_base.value or not en_model.value or not en_voice.value:
+                    ui.notify('英語 TTS の Base URL, Model, Voice を指定してください．', type='warning')
+                    return
+
+                en_test_btn.disable()
+                en_audio_container.clear()
+                with en_audio_container:
+                    ui.label('Synthesizing speech...').classes('text-xs text-zinc-400')
+                try:
+                    tts_cfg = {
+                        'base_url': en_base.value.strip(),
+                        'api_key': 'dummy',
+                        'model': en_model.value.strip(),
+                        'voice': en_voice.value.strip(),
+                        'response_format': 'mp3',
+                    }
+                    out_path = TEST_AUDIO_DIR / 'test_en.mp3'
+
+                    def call_tts():
+                        cl = make_client(tts_cfg)
+                        resp = cl.audio.speech.create(
+                            model=tts_cfg['model'],
+                            voice=tts_cfg['voice'],
+                            input=txt,
+                            response_format='mp3',
+                        )
+                        resp.write_to_file(out_path)
+
+                    await run.io_bound(call_tts)
+                    en_audio_container.clear()
+                    with en_audio_container:
+                        ui.audio(file_url(out_path)).props('autoplay').classes('w-full max-w-lg mt-1')
+                    ui.notify('英語音声を合成しました．', type='positive')
+                except Exception as err:
+                    en_audio_container.clear()
+                    with en_audio_container:
+                        ui.label(f'【TTS合成失敗】: {err}').classes('text-xs text-red-400')
+                    ui.notify(f'英語 TTS テストに失敗しました: {err}', type='negative')
+                finally:
+                    en_test_btn.enable()
+
+            en_test_btn.on_click(run_en_tts_test)
+
+        return (ja_base, ja_model, ja_voice), (en_base, en_model, en_voice)
+
+    def _build_dict_editor(self) -> None:
+        """tts_filter.yaml の単語辞書編集UIを構築します"""
+        filter_cfg = load_tts_filter_config(TTS_FILTER_PATH) if TTS_FILTER_PATH.exists() else {}
+        filter_dict = filter_cfg.setdefault('dictionary', {})
+
+        ui.separator().classes('my-4')
+        ui.label('🤖 日本語TTS用ヨミ変換フィルタ (`tts_filter.yaml`)').classes('text-h5')
+        ui.label('技術用語・識別子・コマンド等の読み仮名辞書を編集できます．')
+
+        with ui.row().classes('w-full items-end'):
+            new_word = ui.input('単語・識別子（例: argc）').classes('grow')
+            new_reading = ui.input('読みの目安（例: アーギューシー）').classes('grow')
+
+            def add_word() -> None:
+                if new_word.value and new_reading.value:
+                    filter_dict[new_word.value.strip()] = new_reading.value.strip()
+                    save_config(TTS_FILTER_PATH, filter_cfg)
+                    ui.notify(f'「{new_word.value.strip()} → {new_reading.value.strip()}」を追加しました．', type='positive')
+                    self.refresh_settings()
+
+            ui.button('辞書に追加', on_click=add_word)
+
+        rows = [{'単語 / 識別子': k, '読みの目安': v} for k, v in filter_dict.items()]
+        grid = ui.aggrid({
+            'columnDefs': [
+                {'headerName': '単語 / 識別子', 'field': '単語 / 識別子', 'editable': True},
+                {'headerName': '読みの目安', 'field': '読みの目安', 'editable': True},
+            ],
+            'rowData': rows,
+            ':getRowId': '(params) => params.data[\"単語 / 識別子\"]',
+            'defaultColDef': {'flex': 1, 'resizable': True},
+            'animateRows': False,
+            'stopEditingWhenCellsLoseFocus': True,
+        }).classes('w-full h-96')
+
+        async def save_dictionary() -> None:
+            await grid.load_client_data()
+            data = grid.options.get('rowData', [])
+            new_dictionary = {}
+            for row in data or []:
+                w = str(row.get('単語 / 識別子', '')).strip()
+                r = str(row.get('読みの目安', '')).strip()
+                if w and r and w != 'nan' and r != 'nan':
+                    new_dictionary[w] = r
+            filter_cfg['dictionary'] = new_dictionary
+            save_config(TTS_FILTER_PATH, filter_cfg)
+            ui.notify(f'tts_filter.yaml を更新しました（全 {len(new_dictionary)} 件）．', type='positive')
+
+        ui.button('💾 ヨミ変換辞書 (tts_filter.yaml) を保存', on_click=save_dictionary).classes('w-full')
 
     def refresh_settings(self) -> None:
+        """設定タブ全体の構築（各セクションメソッドを順次呼び出し）"""
         if not self.settings_container:
             return
         self.settings_container.clear()
-        filter_cfg = load_tts_filter_config(TTS_FILTER_PATH) if TTS_FILTER_PATH.exists() else {}
-        filter_dict = filter_cfg.setdefault('dictionary', {})
+
         with self.settings_container:
             ui.label('システム設定').classes('text-h4')
 
-            # --- LLM 設定 ---
-            ui.label('LLM 設定 (`config.yaml`)').classes('text-h5')
-            llm = self.cfg.setdefault('llm', {})
-            with ui.row().classes('w-full'):
-                llm_base = ui.input('LLM Base URL', value=llm.get('base_url', '')).classes('grow')
-                llm_model = ui.input('LLM Model', value=llm.get('model', '')).classes('grow')
-                llm_temp = ui.number('Temperature', value=float(llm.get('temperature', 0.3)), min=0, max=2, step=0.1).classes('w-40')
+            llm_base, llm_model, llm_temp = self._build_llm_settings()
+            (ja_base, ja_model, ja_voice), (en_base, en_model, en_voice) = self._build_tts_settings()
 
-            with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-700 rounded-lg gap-2 mt-1'):
-                ui.label('🧪 LLM 接続テスト（シングルターン会話）').classes('text-sm font-bold text-zinc-200')
-                with ui.row().classes('w-full items-center gap-2'):
-                    llm_test_input = ui.input(
-                        'テストプロンプト',
-                        value='こんにちは！自己紹介を1文でしてください．',
-                    ).props('dense outlined').classes('grow')
-                    llm_test_btn = ui.button('💬 LLM 接続テスト送信').props('dense outline')
-
-                llm_test_result = ui.label('').classes('text-xs text-zinc-300 font-mono p-2 bg-zinc-800 rounded min-h-[36px] w-full whitespace-pre-wrap')
-
-                async def run_llm_test() -> None:
-                    prompt = (llm_test_input.value or '').strip()
-                    if not prompt:
-                        ui.notify('プロンプトを入力してください．', type='warning')
-                        return
-                    if not llm_base.value or not llm_model.value:
-                        ui.notify('Base URL と Model を入力してください．', type='warning')
-                        return
-
-                    llm_test_btn.disable()
-                    llm_test_result.text = 'LLMにリクエスト中…'
-                    try:
-                        test_cfg = {
-                            'base_url': llm_base.value.strip(),
-                            'api_key': llm.get('api_key', 'dummy'),
-                        }
-                        client = await run.io_bound(make_client, test_cfg)
-
-                        def call_llm() -> str:
-                            res = client.chat.completions.create(
-                                model=llm_model.value.strip(),
-                                temperature=float(llm_temp.value or 0.3),
-                                max_tokens=1000,
-                                messages=[{'role': 'user', 'content': prompt}],
-                            )
-                            return res.choices[0].message.content or '（空の応答でした）'
-
-                        answer = await run.io_bound(call_llm)
-                        llm_test_result.text = answer
-                        ui.notify('LLMからの応答を受信しました．', type='positive')
-                    except Exception as err:
-                        llm_test_result.text = f'【エラー】\n{err}'
-                        ui.notify(f'LLM接続テストに失敗しました: {err}', type='negative')
-                    finally:
-                        llm_test_btn.enable()
-
-                llm_test_btn.on_click(run_llm_test)
-
-            # --- 日本語 TTS 設定 ---
-            ui.separator().classes('my-4')
-            ui.label('🇯🇵 日本語 TTS 設定 (`config.yaml: tts.ja`)').classes('text-h5')
-            tts = self.cfg.setdefault('tts', {})
-            ja = tts.setdefault('ja', {})
-            with ui.row().classes('w-full'):
-                ja_base = ui.input('日本語 Base URL', value=ja.get('base_url', '')).classes('grow')
-                ja_model = ui.input('日本語 Model', value=ja.get('model', '')).classes('grow')
-                ja_voice = ui.input('日本語 Voice', value=ja.get('voice', '')).classes('grow')
-
-            with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-700 rounded-lg gap-2 mt-1'):
-                ui.label('🧪 日本語 TTS 接続・音声再生テスト').classes('text-sm font-bold text-zinc-200')
-                with ui.row().classes('w-full items-center gap-2'):
-                    ja_test_text = ui.input(
-                        '読み上げテキスト',
-                        value='こんにちは。日本語の音声合成テストです。正常に聞こえますか？',
-                    ).props('dense outlined').classes('grow')
-                    ja_test_btn = ui.button('🔊 音声を生成・再生').props('dense outline')
-
-                ja_audio_container = ui.column().classes('w-full')
-
-                async def run_ja_tts_test() -> None:
-                    txt = (ja_test_text.value or '').strip()
-                    if not txt:
-                        ui.notify('読み上げテキストを入力してください．', type='warning')
-                        return
-                    if not ja_base.value or not ja_model.value or not ja_voice.value:
-                        ui.notify('日本語 TTS の Base URL, Model, Voice を指定してください．', type='warning')
-                        return
-
-                    ja_test_btn.disable()
-                    ja_audio_container.clear()
-                    with ja_audio_container:
-                        ui.label('音声を合成中…').classes('text-xs text-zinc-400')
-                    try:
-                        tts_cfg = {
-                            'base_url': ja_base.value.strip(),
-                            'api_key': 'dummy',
-                            'model': ja_model.value.strip(),
-                            'voice': ja_voice.value.strip(),
-                            'response_format': 'mp3',
-                        }
-                        out_path = TEST_AUDIO_DIR / 'test_ja.mp3'
-
-                        def call_tts():
-                            cl = make_client(tts_cfg)
-                            resp = cl.audio.speech.create(
-                                model=tts_cfg['model'],
-                                voice=tts_cfg['voice'],
-                                input=txt,
-                                response_format='mp3',
-                            )
-                            resp.write_to_file(out_path)
-
-                        await run.io_bound(call_tts)
-                        ja_audio_container.clear()
-                        with ja_audio_container:
-                            ui.audio(file_url(out_path)).props('autoplay').classes('w-full max-w-lg mt-1')
-                        ui.notify('日本語音声を合成しました．', type='positive')
-                    except Exception as err:
-                        ja_audio_container.clear()
-                        with ja_audio_container:
-                            ui.label(f'【TTS合成失敗】: {err}').classes('text-xs text-red-400')
-                        ui.notify(f'日本語 TTS テストに失敗しました: {err}', type='negative')
-                    finally:
-                        ja_test_btn.enable()
-
-                ja_test_btn.on_click(run_ja_tts_test)
-
-            # --- 英語 TTS 設定 ---
-            ui.separator().classes('my-4')
-            ui.label('🇺🇸 英語 TTS 設定 (`config.yaml: tts.en`)').classes('text-h5')
-            en = tts.setdefault('en', {})
-            with ui.row().classes('w-full'):
-                en_base = ui.input('英語 Base URL', value=en.get('base_url', '')).classes('grow')
-                en_model = ui.input('英語 Model', value=en.get('model', '')).classes('grow')
-                en_voice = ui.input('英語 Voice', value=en.get('voice', '')).classes('grow')
-
-            with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-700 rounded-lg gap-2 mt-1'):
-                ui.label('🧪 英語 TTS 接続・音声再生テスト').classes('text-sm font-bold text-zinc-200')
-                with ui.row().classes('w-full items-center gap-2'):
-                    en_test_text = ui.input(
-                        '読み上げテキスト (English)',
-                        value='Hello! This is a test for English text-to-speech synthesis.',
-                    ).props('dense outlined').classes('grow')
-                    en_test_btn = ui.button('🔊 音声を生成・再生').props('dense outline')
-
-                en_audio_container = ui.column().classes('w-full')
-
-                async def run_en_tts_test() -> None:
-                    txt = (en_test_text.value or '').strip()
-                    if not txt:
-                        ui.notify('Text is required.', type='warning')
-                        return
-                    if not en_base.value or not en_model.value or not en_voice.value:
-                        ui.notify('英語 TTS の Base URL, Model, Voice を指定してください．', type='warning')
-                        return
-
-                    en_test_btn.disable()
-                    en_audio_container.clear()
-                    with en_audio_container:
-                        ui.label('Synthesizing speech...').classes('text-xs text-zinc-400')
-                    try:
-                        tts_cfg = {
-                            'base_url': en_base.value.strip(),
-                            'api_key': 'dummy',
-                            'model': en_model.value.strip(),
-                            'voice': en_voice.value.strip(),
-                            'response_format': 'mp3',
-                        }
-                        out_path = TEST_AUDIO_DIR / 'test_en.mp3'
-
-                        def call_tts():
-                            cl = make_client(tts_cfg)
-                            resp = cl.audio.speech.create(
-                                model=tts_cfg['model'],
-                                voice=tts_cfg['voice'],
-                                input=txt,
-                                response_format='mp3',
-                            )
-                            resp.write_to_file(out_path)
-
-                        await run.io_bound(call_tts)
-                        en_audio_container.clear()
-                        with en_audio_container:
-                            ui.audio(file_url(out_path)).props('autoplay').classes('w-full max-w-lg mt-1')
-                        ui.notify('英語音声を合成しました．', type='positive')
-                    except Exception as err:
-                        en_audio_container.clear()
-                        with en_audio_container:
-                            ui.label(f'【TTS合成失敗】: {err}').classes('text-xs text-red-400')
-                        ui.notify(f'英語 TTS テストに失敗しました: {err}', type='negative')
-                    finally:
-                        en_test_btn.enable()
-
-                en_test_btn.on_click(run_en_tts_test)
-
-            # --- config.yaml 保存ボタン ---
             def save_main_config() -> None:
                 self.cfg['llm']['base_url'] = llm_base.value
                 self.cfg['llm']['model'] = llm_model.value
@@ -1308,49 +1341,7 @@ class SlideNarratorApp:
 
             ui.button('💾 config.yaml を保存', on_click=save_main_config).classes('w-full mt-4')
 
-            # --- 日本語TTS用ヨミ変換フィルタ ---
-            ui.separator().classes('my-4')
-            ui.label('🤖 日本語TTS用ヨミ変換フィルタ (`tts_filter.yaml`)').classes('text-h5')
-            ui.label('技術用語・識別子・コマンド等の読み仮名辞書を編集できます．')
-
-            with ui.row().classes('w-full items-end'):
-                new_word = ui.input('単語・識別子（例: argc）').classes('grow')
-                new_reading = ui.input('読みの目安（例: アーギューシー）').classes('grow')
-                def add_word() -> None:
-                    if new_word.value and new_reading.value:
-                        filter_dict[new_word.value.strip()] = new_reading.value.strip()
-                        save_config(TTS_FILTER_PATH, filter_cfg)
-                        ui.notify(f'「{new_word.value.strip()} → {new_reading.value.strip()}」を追加しました．', type='positive')
-                        self.refresh_settings()
-                ui.button('辞書に追加', on_click=add_word)
-
-            rows = [{'単語 / 識別子': k, '読みの目安': v} for k, v in filter_dict.items()]
-            grid = ui.aggrid({
-                'columnDefs': [
-                    {'headerName': '単語 / 識別子', 'field': '単語 / 識別子', 'editable': True},
-                    {'headerName': '読みの目安', 'field': '読みの目安', 'editable': True},
-                ],
-                'rowData': rows,
-                ':getRowId': '(params) => params.data[\"単語 / 識別子\"]',
-                'defaultColDef': {'flex': 1, 'resizable': True},
-                'animateRows': False,
-                'stopEditingWhenCellsLoseFocus': True,
-            }).classes('w-full h-96')
-
-            async def save_dictionary() -> None:
-                await grid.load_client_data()
-                data = grid.options.get('rowData', [])
-                new_dictionary = {}
-                for row in data or []:
-                    w = str(row.get('単語 / 識別子', '')).strip()
-                    r = str(row.get('読みの目安', '')).strip()
-                    if w and r and w != 'nan' and r != 'nan':
-                        new_dictionary[w] = r
-                filter_cfg['dictionary'] = new_dictionary
-                save_config(TTS_FILTER_PATH, filter_cfg)
-                ui.notify(f'tts_filter.yaml を更新しました（全 {len(new_dictionary)} 件）．', type='positive')
-
-            ui.button('💾 ヨミ変換辞書 (tts_filter.yaml) を保存', on_click=save_dictionary).classes('w-full')
+            self._build_dict_editor()
 
     # ---- global refresh ----------------------------------------------
 
