@@ -24,7 +24,7 @@ Turn your PDF presentation slides into narrated lecture videos with AI.
        - これは負荷が軽いのでCPUで稼働
    - 実行は遅いかもしれませんが，DGX Spark が1台あれば十分動かせると思います． 
        
-![img](2026-10-05_21-09.png)
+![img](screenshot.png)
 
 ## セットアップ(Linuxの場合)
 ```bash
@@ -49,8 +49,6 @@ LLMとTTSの設定はWebUIからでもできます．
 python3 app.py 
 ```
 ブラウザで http://localhost:17171 に接続後し，IDをパスワードを入力してログインします．あとは，(1)PDFをアップロード，(2)発表種別の選択，(3)主言語(日本語or英語)の選択を行った後，「④動画の生成」ボタンを押すだけです．
-![img](2026-10-04_13-02.png)
-（開発中の画面です）
 
 ## 起動(CLI)
 （省略）
