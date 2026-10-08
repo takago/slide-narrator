@@ -1275,6 +1275,7 @@ class SlideNarratorApp:
                                 temperature=float(llm_temp.value or 0.3),
                                 max_tokens=5000,
                                 messages=[{'role': 'user', 'content': prompt}],
+                                extra_body={"reasoning_effort":"none"}, 
                             )
                             return res.choices[0].message.content or '（空の応答でした）'
 
