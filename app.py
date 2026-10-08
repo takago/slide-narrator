@@ -19,10 +19,8 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import json
 import os
-import re
 import shutil
 import signal
 import subprocess
@@ -45,6 +43,7 @@ from slide_lecture import (
     load_project_json,
     make_client,
     parse_page_ranges,
+    run_vlm_element_detection,
     save_project_json,
 )
 from tts_filter import (
@@ -1352,14 +1351,6 @@ class SlideNarratorApp:
                         }
                         client = await run.io_bound(make_client, test_cfg)
 
-                        img_bytes = img_p.read_bytes()
-                        mime = 'image/png' if img_p.suffix.lower() == '.png' else 'image/jpeg'
-                        b64_str = base64.b64encode(img_bytes).decode('ascii')
-                        data_url = f'data:{mime};base64,{b64_str}'
-
-                        with Image.open(img_p) as im:
-                            orig_w, orig_h = im.size
-
                         prompt = (
                             'この画像について以下の2つを行ってください。\n'
                             '1. 何が写っているか、状況や内容を日本語で2〜3文で簡潔に説明してください。\n'
@@ -1376,75 +1367,15 @@ class SlideNarratorApp:
                             "※ type は 'image_subpart'（注目物体・図形）, 'text'（文字領域）, 'image'（大きな領域）, 'code_line'（コードや数式）のいずれかを指定してください。"
                         )
 
-                        def call_vlm():
-                            res = client.chat.completions.create(
-                                model=selected_model,
-                                temperature=float(llm_temp.value or 0.2),
-                                max_tokens=1500,
-                                messages=[{
-                                    'role': 'user',
-                                    'content': [
-                                        {'type': 'text', 'text': prompt},
-                                        {'type': 'image_url', 'image_url': {'url': data_url}},
-                                    ],
-                                }],
-                            )
-                            return res.choices[0].message.content or ''
-
-                        content = await run.io_bound(call_vlm)
-
-                        parsed_blocks = []
-                        summary_text = content
-
-                        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
-                        if json_match:
-                            try:
-                                jdata = json.loads(json_match.group(1))
-                                summary_text = jdata.get('summary', content)
-                                raw_blocks = jdata.get('blocks', [])
-
-                                for i, b in enumerate(raw_blocks, 1):
-                                    box = b.get('bbox') or b.get('bbox_2d')
-                                    if not box or len(box) != 4:
-                                        continue
-                                    
-                                    # アスペクト比に依存しない安全なスケール変換
-                                    vals = [float(v) for v in box]
-                                    max_v = max(vals)
-
-                                    if max_v <= 1.0:
-                                        scale_w, scale_h = float(orig_w), float(orig_h)
-                                    elif max_v <= 1000.0 and (orig_w > 1000 or orig_h > 1000 or max_v > min(orig_w, orig_h)):
-                                        scale_w, scale_h = orig_w / 1000.0, orig_h / 1000.0
-                                    else:
-                                        scale_w, scale_h = 1.0, 1.0
-
-                                    y0, x0, y1, x1 = vals
-                                    px_x0 = int(round(x0 * scale_w))
-                                    px_x1 = int(round(x1 * scale_w))
-                                    px_y0 = int(round(y0 * scale_h))
-                                    px_y1 = int(round(y1 * scale_h))
-
-                                    x_min = max(0, min(orig_w, min(px_x0, px_x1)))
-                                    x_max = max(0, min(orig_w, max(px_x0, px_x1)))
-                                    y_min = max(0, min(orig_h, min(px_y0, px_y1)))
-                                    y_max = max(0, min(orig_h, max(px_y0, px_y1)))
-
-                                    if x_max <= x_min or y_max <= y_min:
-                                        continue
-
-                                    b_type = b.get('type', 'image_subpart')
-                                    if b_type not in ('image_subpart', 'image', 'text', 'code_line'):
-                                        b_type = 'image_subpart'
-
-                                    parsed_blocks.append({
-                                        'block_id': b.get('block_id', i),
-                                        'type': b_type,
-                                        'bbox': [x_min, y_min, x_max, y_max],
-                                        'label': b.get('label', ''),
-                                    })
-                            except Exception:
-                                pass
+                        summary_text, parsed_blocks = await run.io_bound(
+                            run_vlm_element_detection,
+                            client=client,
+                            model=selected_model,
+                            image_path=img_p,
+                            prompt=prompt,
+                            temperature=float(llm_temp.value or 0.2),
+                            max_tokens=1500,
+                        )
 
                         vlm_description_box.text = summary_text.strip()
                         vlm_status_label.text = f'解析完了: {len(parsed_blocks)} 個の要素を検出しました．'

@@ -469,15 +469,63 @@ def extract_page_blocks(pdf: Path, page_index: int, dpi: int) -> list[dict]:
     return targets
 
 
-def detect_visual_elements_with_vlm(
+# =====================================================================
+# VLM / 画像解析共通ロジック
+# =====================================================================
+
+def parse_vlm_bounding_box(raw_box: Any, img_w: int, img_h: int) -> list[int] | None:
+    """[ymin, xmin, ymax, xmax] 形式の座標を実ピクセル [xmin, ymin, xmax, ymax] に変換・クランプします．
+    
+    0〜1の小数正規化、0〜1000の正規化、実ピクセル直接指定のいずれにも対応します．
+    """
+    if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
+        return None
+
+    try:
+        vals = [float(v) for v in raw_box]
+    except (ValueError, TypeError):
+        return None
+
+    max_v = max(vals)
+    # スケール判定 (0〜1小数, 0〜1000正規化, 実ピクセル直値)
+    if max_v <= 1.0:
+        ymin_norm, xmin_norm, ymax_norm, xmax_norm = vals
+        scale_w, scale_h = float(img_w), float(img_h)
+    elif max_v <= 1000.0 and (img_w > 1000 or img_h > 1000 or max_v > min(img_w, img_h)):
+        ymin_norm, xmin_norm, ymax_norm, xmax_norm = vals
+        scale_w, scale_h = img_w / 1000.0, img_h / 1000.0
+    else:
+        ymin_norm, xmin_norm, ymax_norm, xmax_norm = vals
+        scale_w, scale_h = 1.0, 1.0
+
+    px_x0 = int(round(xmin_norm * scale_w))
+    px_x1 = int(round(xmax_norm * scale_w))
+    px_y0 = int(round(ymin_norm * scale_h))
+    px_y1 = int(round(ymax_norm * scale_h))
+
+    xmin = max(0, min(img_w, min(px_x0, px_x1)))
+    xmax = max(0, min(img_w, max(px_x0, px_x1)))
+    ymin = max(0, min(img_h, min(px_y0, px_y1)))
+    ymax = max(0, min(img_h, max(px_y0, px_y1)))
+
+    if xmax <= xmin or ymax <= ymin:
+        return None
+
+    return [xmin, ymin, xmax, ymax]
+
+
+def run_vlm_element_detection(
     client: OpenAI,
-    cfg: dict,
+    model: str,
     image_path: Path,
-    lang: str = "ja",
-) -> list[dict]:
-    """Vision-LLMを用いて画像・図表の内部構成要素のバウンディングボックスを抽出します．"""
+    prompt: str,
+    system_prompt: str | None = None,
+    temperature: float = 0.2,
+    max_tokens: int = 2000,
+) -> tuple[str, list[dict]]:
+    """任意の画像に対してVLMへ問い合わせを行い、要約テキストとパース済みブロック一覧を返します．"""
     if not image_path.exists():
-        return []
+        return "", []
 
     try:
         with Image.open(image_path) as img:
@@ -485,6 +533,87 @@ def detect_visual_elements_with_vlm(
     except Exception:
         img_w, img_h = 1920, 1080
 
+    content = [
+        {"type": "text", "text": prompt},
+        {"type": "image_url", "image_url": {"url": image_data_url(image_path)}},
+    ]
+
+    messages = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": content})
+
+    response = client.chat.completions.create(
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        messages=messages,
+        extra_body={"reasoning_effort": "none"},
+    )
+
+    raw_text = response.choices[0].message.content or ""
+    summary_text = raw_text
+    parsed_blocks = []
+
+    try:
+        jdata = extract_json(raw_text)
+        if isinstance(jdata, dict):
+            summary_text = jdata.get("summary", raw_text)
+            raw_blocks = jdata.get("blocks", [])
+        elif isinstance(jdata, list):
+            raw_blocks = jdata
+        else:
+            raw_blocks = []
+
+        for i, b in enumerate(raw_blocks, 1):
+            if not isinstance(b, dict):
+                continue
+
+            raw_box = b.get("bbox") or b.get("bbox_2d")
+            pixel_bbox = parse_vlm_bounding_box(raw_box, img_w, img_h)
+            if pixel_bbox is None:
+                continue
+
+            xmin, ymin, xmax, ymax = pixel_bbox
+
+            b_type = b.get("type", "image_subpart")
+            if b_type not in ("image_subpart", "image", "text", "code_line"):
+                b_type = "image_subpart"
+
+            kind = b.get("kind", "text" if b_type == "text" else "graphic")
+            name = b.get("name") or b.get("label", "")
+
+            # テキスト／数式は左端（行頭）から16px内側，図形は矩形中央をポイント
+            if kind == "text" or b_type == "text":
+                px = min(xmax, xmin + 16)
+            else:
+                px = xmin + (xmax - xmin) // 2
+            py = ymin + (ymax - ymin) // 2
+
+            parsed_blocks.append({
+                "block_id": b.get("block_id", i),
+                "type": b_type,
+                "kind": kind,
+                "label": name,
+                "name": name,
+                "text": f"[図内要素:{'文' if kind == 'text' else '図'}] {name}" if name else "[図内要素]",
+                "x": px,
+                "y": py,
+                "bbox": [xmin, ymin, xmax, ymax],
+            })
+    except Exception as e:
+        print(f"[VLM WARN] JSONパース失敗: {e}")
+
+    return summary_text, parsed_blocks
+
+
+def detect_visual_elements_with_vlm(
+    client: OpenAI,
+    cfg: dict,
+    image_path: Path,
+    lang: str = "ja",
+) -> list[dict]:
+    """Vision-LLMを用いて画像・図表の内部構成要素のバウンディングボックスを抽出します．"""
     sys_prompt = DETECT_IMAGE_PARTS_SYSTEM_JA if lang == "ja" else DETECT_IMAGE_PARTS_SYSTEM_EN
     user_instruction = (
         "スライド画像内の図表・グラフに含まれる構成要素（部品・数式・テキスト・凡例・ノードなど）を検出し，"
@@ -493,79 +622,16 @@ def detect_visual_elements_with_vlm(
         else "Detect visual components (parts, formulas, text, legends, nodes), their kind ('text' or 'graphic'), and normalized coordinates (0-1000): [ymin, xmin, ymax, xmax]."
     )
 
-    content = [
-        {"type": "text", "text": user_instruction},
-        {"type": "image_url", "image_url": {"url": image_data_url(image_path)}},
-    ]
-
     try:
-        response = client.chat.completions.create(
+        _, sub_elements = run_vlm_element_detection(
+            client=client,
             model=cfg["model"],
+            image_path=image_path,
+            prompt=user_instruction,
+            system_prompt=sys_prompt,
             temperature=0.0,
             max_tokens=2000,
-            messages=[
-                {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": content},
-            ],
-            extra_body={"reasoning_effort": "none"},
         )
-
-        data = extract_json(response.choices[0].message.content)
-        sub_elements = []
-        if isinstance(data, list):
-            for item in data:
-                if not isinstance(item, dict):
-                    continue
-                raw_box = item.get("bbox")
-                name = item.get("name", "要素")
-                kind = item.get("kind", "graphic")
-
-                if isinstance(raw_box, list) and len(raw_box) == 4:
-                    vals = [float(v) for v in raw_box]
-                    max_v = max(vals)
-
-                    # 座標系判定 (0〜1小数, 0〜1000正規化, ピクセル直値)
-                    # プロンプト仕様 [ymin, xmin, ymax, xmax] に則り幅と高さを独立してスケール
-                    if max_v <= 1.0:
-                        ymin_norm, xmin_norm, ymax_norm, xmax_norm = vals
-                        scale_w, scale_h = float(img_w), float(img_h)
-                    elif max_v <= 1000.0:
-                        ymin_norm, xmin_norm, ymax_norm, xmax_norm = vals
-                        scale_w, scale_h = img_w / 1000.0, img_h / 1000.0
-                    else:
-                        ymin_norm, xmin_norm, ymax_norm, xmax_norm = vals
-                        scale_w, scale_h = 1.0, 1.0
-
-                    px_xmin = int(round(xmin_norm * scale_w))
-                    px_xmax = int(round(xmax_norm * scale_w))
-                    px_ymin = int(round(ymin_norm * scale_h))
-                    px_ymax = int(round(ymax_norm * scale_h))
-
-                    # 順序保証と画像枠内クランプ
-                    xmin = max(0, min(img_w, min(px_xmin, px_xmax)))
-                    xmax = max(0, min(img_w, max(px_xmin, px_xmax)))
-                    ymin = max(0, min(img_h, min(px_ymin, px_ymax)))
-                    ymax = max(0, min(img_h, max(px_ymin, px_ymax)))
-
-                    if xmax <= xmin or ymax <= ymin:
-                        continue
-
-                    # テキスト／数式は左端（行頭）から16px内側，図形は矩形中央をポイント
-                    if kind == "text":
-                        px = min(xmax, xmin + 16)
-                    else:
-                        px = xmin + (xmax - xmin) // 2
-
-                    py = ymin + (ymax - ymin) // 2
-
-                    sub_elements.append({
-                        "type": "image_subpart",
-                        "kind": kind,
-                        "text": f"[図内要素:{'文' if kind == 'text' else '図'}] {name}",
-                        "x": px,
-                        "y": py,
-                        "bbox": [xmin, ymin, xmax, ymax],
-                    })
         return sub_elements
     except Exception as e:
         print(f"[VLM WARN] 図表内要素の検出に失敗しました（スキップします）: {e}")
@@ -777,8 +843,10 @@ def create_laser_dot_image(out_path: Path, radius: int = 14) -> Path:
 
 
 def image_data_url(path: Path) -> str:
+    ext = path.suffix.lower()
+    mime = "image/png" if ext == ".png" else "image/jpeg"
     data = base64.b64encode(path.read_bytes()).decode("ascii")
-    return f"data:image/png;base64,{data}"
+    return f"data:{mime};base64,{data}"
 
 
 def extract_json(text: str) -> dict | list:
