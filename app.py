@@ -1054,8 +1054,9 @@ class SlideNarratorApp:
                     ).props('dense color=primary')
                     page_vlm_switch.tooltip('ONにすると図やグラフ・数式の内部要素まで細かくポインティングします．OFFにするとPDFテキストのみを使用します．')
 
-            with ui.row().classes('w-full items-start gap-6'):
-                with ui.column().classes('w-5/12 gap-3'):
+            # VLMテストと同じ配置：スライド画像を左，検出要素一覧を右に固定して横並びにする．
+            with ui.row().classes('w-full items-start gap-6 flex-nowrap'):
+                with ui.column().classes('flex-[2] min-w-0 gap-3'):
                     if img.exists():
                         preview = draw_block_preview(img, blocks) if blocks else None
                         if preview is not None:
@@ -1093,8 +1094,84 @@ class SlideNarratorApp:
                                 on_click=lambda _, p=page: self.generate_slide_tts(p),
                             ).props('dense color=primary size=sm').classes('w-full')
 
-                with ui.column().classes('w-7/12'):
-                    main_lang = '日本語' if self.lang_code == 'ja' else '英語'
+                with ui.column().classes('flex-[3] min-w-0 gap-3'):
+                    ui.label('🎯 検出された要素一覧（バッジ対応）').classes('text-xs font-semibold text-zinc-400')
+                    badge_colors = {
+                        'image_subpart': ('bg-red-500/20 text-red-300 border-red-500/40', '注目要素'),
+                        'image': ('bg-amber-500/20 text-amber-300 border-amber-500/40', '画像・領域'),
+                        'text': ('bg-blue-500/20 text-blue-300 border-blue-500/40', 'テキスト'),
+                        'code_line': ('bg-cyan-500/20 text-cyan-300 border-cyan-500/40', 'コード/数式'),
+                    }
+                    if not blocks:
+                        ui.label('（検出された要素はありません）').classes('text-xs text-zinc-500 italic')
+                    else:
+                        with ui.column().classes('w-full gap-1.5 max-h-[450px] overflow-y-auto pr-1'):
+                            for b in blocks:
+                                bid = b.get('block_id')
+                                label = b.get('label') or '名称なし'
+                                btype = b.get('type', 'image_subpart')
+                                style_cls, type_name = badge_colors.get(btype, badge_colors['image_subpart'])
+
+                                with ui.row().classes(
+                                    'w-full items-center justify-between p-2 rounded bg-zinc-900/90 '
+                                    'border border-zinc-800 hover:border-zinc-700 transition-colors'
+                                ):
+                                    with ui.row().classes('items-center gap-2 grow'):
+                                        ui.label(f'#{bid}').classes(
+                                            f'text-xs font-bold font-mono px-2 py-0.5 rounded border {style_cls}'
+                                        )
+                                        ui.label(label).classes('text-xs text-zinc-200 font-medium break-all')
+
+                                    ui.badge(type_name).props('outline').classes('text-[10px] text-zinc-400 shrink-0')
+
+            with ui.column().classes('w-full gap-3 pt-2'):
+                main_lang = '日本語' if self.lang_code == 'ja' else '英語'
+                text_area = ui.textarea(
+                    f'主言語ナレーション原稿（{main_lang}）',
+                    value=current_text,
+                ).props('outlined').classes('w-full').style('min-height: 180px')
+                with ui.row().classes('w-full gap-2'):
+                    ui.button('✨ ナレーションを再生成',
+                              on_click=lambda: self.regenerate_narration(page, text_area)).classes('grow').props('outline')
+                    ui.button('🔄 保存して字幕・ポインタを再解析',
+                              on_click=lambda: self.save_and_realign(page, text_area.value, page_vlm_switch.value)).classes('grow').props('color=primary')
+
+                if alignments:
+                    ui.separator()
+                    ui.label('🎯 文ごとのポインタ先 & 対訳字幕の微調整').classes('text-h6')
+                    block_options = [None] + [b['block_id'] for b in blocks]
+                    rows = []
+                    for item in alignments:
+                        rows.append({
+                            'sentence': item.get('sentence', ''),
+                            'block_id': item.get('block_id'),
+                            'translation': item.get('en_sentence', '') if self.lang_code == 'ja' else item.get('ja_sentence', ''),
+                        })
+
+                    for i, row in enumerate(rows, 1):
+                        with ui.card().classes('w-full p-4 bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded-lg gap-2 shadow-xs'):
+                            with ui.row().classes('w-full items-start gap-2'):
+                                ui.label(f'文 {i}').classes('text-xs font-bold text-white bg-blue-600 dark:bg-blue-500 px-2 py-0.5 rounded shrink-0 mt-0.5')
+                                ui.label(row['sentence']).classes('text-sm font-medium text-gray-900 dark:text-gray-100 grow leading-relaxed')
+
+                            with ui.row().classes('w-full items-center gap-3 pt-1'):
+                                select = ui.select(block_options, value=row['block_id'], label='ポインタ先').props('dense outlined').classes('w-44 shrink-0')
+                                trans = ui.input('対訳字幕', value=row['translation']).props('dense outlined').classes('grow')
+                                row['_select'] = select
+                                row['_trans'] = trans
+
+                    async def save_rows() -> None:
+                        out = []
+                        for row in rows:
+                            bid = row['_select'].value
+                            tr = row['_trans'].value or ''
+                            if self.lang_code == 'ja':
+                                out.append({'sentence': row['sentence'], 'block_id': bid, 'ja_sentence': row['sentence'], 'en_sentence': tr})
+                            else:
+                                out.append({'sentence': row['sentence'], 'block_id': bid, 'en_sentence': row['sentence'], 'ja_sentence': tr})
+                        await self.save_alignment(page, out, align_data)
+
+                    ui.button('💾 字幕・ポインタ修正を保存', on_click=save_rows).classes('w-full mt-2')
                     text_area = ui.textarea(
                         f'主言語ナレーション原稿（{main_lang}）',
                         value=current_text,
@@ -1275,7 +1352,7 @@ class SlideNarratorApp:
                             res = client.chat.completions.create(
                                 model=selected_model,
                                 temperature=float(llm_temp.value or 0.3),
-                                max_tokens=4000,
+                                max_tokens=5000,
                                 messages=[{'role': 'user', 'content': prompt}],
                                 extra_body={"reasoning_effort": "none"},
                             )
