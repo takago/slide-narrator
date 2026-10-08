@@ -1273,7 +1273,7 @@ class SlideNarratorApp:
                             res = client.chat.completions.create(
                                 model=selected_model,
                                 temperature=float(llm_temp.value or 0.3),
-                                max_tokens=1000,
+                                max_tokens=5000,
                                 messages=[{'role': 'user', 'content': prompt}],
                             )
                             return res.choices[0].message.content or '（空の応答でした）'
