@@ -519,22 +519,33 @@ def detect_visual_elements_with_vlm(
                 raw_box = item.get("bbox")
                 name = item.get("name", "要素")
                 kind = item.get("kind", "graphic")
+
                 if isinstance(raw_box, list) and len(raw_box) == 4:
-                    is_normalized = max(raw_box) <= 1000
+                    vals = [float(v) for v in raw_box]
+                    max_v = max(vals)
 
-                    if is_normalized:
-                        ymin_norm, xmin_norm, ymax_norm, xmax_norm = raw_box
-                        xmin = int((xmin_norm / 1000.0) * img_w)
-                        xmax = int((xmax_norm / 1000.0) * img_w)
-                        ymin = int((ymin_norm / 1000.0) * img_h)
-                        ymax = int((ymax_norm / 1000.0) * img_h)
+                    # 座標系判定 (0〜1小数, 0〜1000正規化, ピクセル直値)
+                    # プロンプト仕様 [ymin, xmin, ymax, xmax] に則り幅と高さを独立してスケール
+                    if max_v <= 1.0:
+                        ymin_norm, xmin_norm, ymax_norm, xmax_norm = vals
+                        scale_w, scale_h = float(img_w), float(img_h)
+                    elif max_v <= 1000.0:
+                        ymin_norm, xmin_norm, ymax_norm, xmax_norm = vals
+                        scale_w, scale_h = img_w / 1000.0, img_h / 1000.0
                     else:
-                        xmin, ymin, xmax, ymax = [int(v) for v in raw_box]
+                        ymin_norm, xmin_norm, ymax_norm, xmax_norm = vals
+                        scale_w, scale_h = 1.0, 1.0
 
-                    xmin = max(0, min(img_w, xmin))
-                    ymin = max(0, min(img_h, ymin))
-                    xmax = max(0, min(img_w, xmax))
-                    ymax = max(0, min(img_h, ymax))
+                    px_xmin = int(round(xmin_norm * scale_w))
+                    px_xmax = int(round(xmax_norm * scale_w))
+                    px_ymin = int(round(ymin_norm * scale_h))
+                    px_ymax = int(round(ymax_norm * scale_h))
+
+                    # 順序保証と画像枠内クランプ
+                    xmin = max(0, min(img_w, min(px_xmin, px_xmax)))
+                    xmax = max(0, min(img_w, max(px_xmin, px_xmax)))
+                    ymin = max(0, min(img_h, min(px_ymin, px_ymax)))
+                    ymax = max(0, min(img_h, max(px_ymin, px_ymax)))
 
                     if xmax <= xmin or ymax <= ymin:
                         continue

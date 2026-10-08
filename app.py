@@ -19,8 +19,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -60,6 +62,7 @@ from tts_filter import (
 # ユーザー名とパスワード（運用環境に合わせて変更してください）
 USERS = {
     'admin': 'secret',
+    'guest': 'guest',
 }
 
 
@@ -73,6 +76,8 @@ UPLOAD_DIR = Path('webui_uploads')
 UPLOAD_DIR.mkdir(exist_ok=True)
 TEST_AUDIO_DIR = UPLOAD_DIR / 'test_audio'
 TEST_AUDIO_DIR.mkdir(exist_ok=True)
+TEST_VLM_DIR = UPLOAD_DIR / 'test_vlm'
+TEST_VLM_DIR.mkdir(exist_ok=True)
 
 
 def load_config(path: Path) -> dict:
@@ -1187,8 +1192,8 @@ class SlideNarratorApp:
             with ui.row().classes('w-full items-center justify-between border-b border-zinc-800 pb-2'):
                 with ui.row().classes('items-center gap-2'):
                     ui.icon('psychology', size='sm').classes('text-blue-400')
-                    ui.label('メイン LLM 設定 (`config.yaml: llm`)').classes('text-lg font-bold text-zinc-100')
-                ui.label('ナレーション原稿作成・字幕対訳・アライメント解析').classes('text-xs text-zinc-400')
+                    ui.label('メイン LLM / VLM 設定 (`config.yaml: llm`)').classes('text-lg font-bold text-zinc-100')
+                ui.label('ナレーション原稿作成・字幕対訳・VLM画像アライメント解析').classes('text-xs text-zinc-400')
 
             llm = self.cfg.setdefault('llm', {})
             current_model = llm.get('model', '')
@@ -1234,8 +1239,9 @@ class SlideNarratorApp:
 
             fetch_btn.on_click(fetch_llm_models)
 
+            # テキスト接続テスト
             with ui.card().classes('w-full p-3 bg-zinc-950 border border-zinc-800 rounded-lg gap-2'):
-                ui.label('🧪 LLM 接続テスト（シングルターン会話）').classes('text-xs font-bold text-zinc-300')
+                ui.label('🧪 LLM 接続テスト（テキスト応答）').classes('text-xs font-bold text-zinc-300')
                 with ui.row().classes('w-full items-center gap-2'):
                     llm_test_input = ui.input(
                         'テストプロンプト',
@@ -1283,6 +1289,232 @@ class SlideNarratorApp:
                         llm_test_btn.enable()
 
                 llm_test_btn.on_click(run_llm_test)
+
+            # --- VLM マルチモーダル接続テスト（任意の画像対応 & アスペクト比補正 & 番号凡例付き） ---
+            with ui.card().classes('w-full p-3 bg-zinc-950 border border-zinc-800 rounded-lg gap-3 mt-2'):
+                with ui.row().classes('items-center justify-between w-full'):
+                    ui.label('👁️ VLM 画像認識 & アライメントテスト').classes('text-xs font-bold text-zinc-300')
+                    ui.label('任意の画像（写真・イラスト・図表など何でも可）を放り込んで認識とバウンディングボックス抽出をテスト').classes('text-xs text-zinc-500')
+
+                uploaded_vlm_img = {'path': None}
+
+                with ui.row().classes('w-full items-start gap-4'):
+                    with ui.column().classes('w-80 shrink-0 gap-2'):
+                        vlm_uploader = ui.upload(
+                            label='画像をアップロード（何でも可）',
+                            auto_upload=True,
+                            max_files=1,
+                        ).props('accept="image/*" dense').classes('w-full')
+
+                        vlm_run_btn = ui.button('🔍 VLM解析を実行', color='primary').props('dense outline').classes('w-full')
+                        vlm_run_btn.disable()
+
+                        async def handle_vlm_upload(e):
+                            ext = Path(e.file.name).suffix or '.png'
+                            saved_path = TEST_VLM_DIR / f'vlm_test_input{ext}'
+                            await e.file.save(saved_path)
+                            uploaded_vlm_img['path'] = saved_path
+                            vlm_run_btn.enable()
+                            vlm_preview_container.clear()
+                            vlm_blocks_container.clear()
+                            with vlm_preview_container:
+                                ui.image(file_url(saved_path)).classes('w-full rounded border border-zinc-700 shadow-sm')
+                            ui.notify('テスト画像を読み込みました．「VLM解析を実行」を押してください．', type='info')
+
+                        vlm_uploader.on_upload(handle_vlm_upload)
+
+                    with ui.column().classes('grow gap-2'):
+                        vlm_status_label = ui.label('画像をアップロードしてテストを開始してください．').classes('text-xs text-zinc-400')
+                        vlm_description_box = ui.label('').classes('text-xs text-zinc-300 font-sans p-3 bg-zinc-900 border border-zinc-800 rounded min-h-[48px] w-full whitespace-pre-wrap leading-relaxed')
+
+                # 解析結果（プレビュー画像 ＆ ブロック凡例 ＆ JSON）表示領域
+                vlm_preview_container = ui.column().classes('w-full')
+                vlm_blocks_container = ui.column().classes('w-full')
+
+                async def run_vlm_test() -> None:
+                    img_p: Path | None = uploaded_vlm_img['path']
+                    if not img_p or not img_p.exists():
+                        ui.notify('テスト画像をアップロードしてください．', type='warning')
+                        return
+                    selected_model = (str(llm_model_select.value) if llm_model_select.value is not None else '').strip()
+                    if not llm_base.value or not selected_model:
+                        ui.notify('Base URL と Model を設定してください．', type='warning')
+                        return
+
+                    vlm_run_btn.disable()
+                    vlm_status_label.text = 'VLMで画像認識・要素検出中…'
+                    vlm_description_box.text = '解析中…'
+
+                    try:
+                        test_cfg = {
+                            'base_url': llm_base.value.strip(),
+                            'api_key': (llm_key.value or '').strip() or 'dummy',
+                        }
+                        client = await run.io_bound(make_client, test_cfg)
+
+                        img_bytes = img_p.read_bytes()
+                        mime = 'image/png' if img_p.suffix.lower() == '.png' else 'image/jpeg'
+                        b64_str = base64.b64encode(img_bytes).decode('ascii')
+                        data_url = f'data:{mime};base64,{b64_str}'
+
+                        with Image.open(img_p) as im:
+                            orig_w, orig_h = im.size
+
+                        prompt = (
+                            'この画像について以下の2つを行ってください。\n'
+                            '1. 何が写っているか、状況や内容を日本語で2〜3文で簡潔に説明してください。\n'
+                            '2. 画像内の主要な物体、被写体、人物、テキスト、アイコン、図表要素などを検出し、'
+                            'そのバウンディングボックスをJSON形式（```json ... ```）で出力してください。\n'
+                            'フォーマット仕様:\n'
+                            '{\n'
+                            '  "summary": "画像の説明文",\n'
+                            '  "blocks": [\n'
+                            '    {"block_id": 1, "type": "image_subpart", "label": "要素名（例: 猫, 人物, タイトル文字列など）", "bbox": [ymin, xmin, ymax, xmax]}\n'
+                            '  ]\n'
+                            '}\n'
+                            "※ bbox は [ymin, xmin, ymax, xmax] の順で、0〜1000 の正規化座標（縦の割合がymin/ymax、横の割合がxmin/xmax）で出力してください。\n"
+                            "※ type は 'image_subpart'（注目物体・図形）, 'text'（文字領域）, 'image'（大きな領域）, 'code_line'（コードや数式）のいずれかを指定してください。"
+                        )
+
+                        def call_vlm():
+                            res = client.chat.completions.create(
+                                model=selected_model,
+                                temperature=float(llm_temp.value or 0.2),
+                                max_tokens=1500,
+                                messages=[{
+                                    'role': 'user',
+                                    'content': [
+                                        {'type': 'text', 'text': prompt},
+                                        {'type': 'image_url', 'image_url': {'url': data_url}},
+                                    ],
+                                }],
+                            )
+                            return res.choices[0].message.content or ''
+
+                        content = await run.io_bound(call_vlm)
+
+                        parsed_blocks = []
+                        summary_text = content
+
+                        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
+                        if json_match:
+                            try:
+                                jdata = json.loads(json_match.group(1))
+                                summary_text = jdata.get('summary', content)
+                                raw_blocks = jdata.get('blocks', [])
+
+                                for i, b in enumerate(raw_blocks, 1):
+                                    box = b.get('bbox') or b.get('bbox_2d')
+                                    if not box or len(box) != 4:
+                                        continue
+                                    
+                                    # アスペクト比に依存しない安全なスケール変換
+                                    vals = [float(v) for v in box]
+                                    max_v = max(vals)
+
+                                    if max_v <= 1.0:
+                                        scale_w, scale_h = float(orig_w), float(orig_h)
+                                    elif max_v <= 1000.0 and (orig_w > 1000 or orig_h > 1000 or max_v > min(orig_w, orig_h)):
+                                        scale_w, scale_h = orig_w / 1000.0, orig_h / 1000.0
+                                    else:
+                                        scale_w, scale_h = 1.0, 1.0
+
+                                    y0, x0, y1, x1 = vals
+                                    px_x0 = int(round(x0 * scale_w))
+                                    px_x1 = int(round(x1 * scale_w))
+                                    px_y0 = int(round(y0 * scale_h))
+                                    px_y1 = int(round(y1 * scale_h))
+
+                                    x_min = max(0, min(orig_w, min(px_x0, px_x1)))
+                                    x_max = max(0, min(orig_w, max(px_x0, px_x1)))
+                                    y_min = max(0, min(orig_h, min(px_y0, px_y1)))
+                                    y_max = max(0, min(orig_h, max(px_y0, px_y1)))
+
+                                    if x_max <= x_min or y_max <= y_min:
+                                        continue
+
+                                    b_type = b.get('type', 'image_subpart')
+                                    if b_type not in ('image_subpart', 'image', 'text', 'code_line'):
+                                        b_type = 'image_subpart'
+
+                                    parsed_blocks.append({
+                                        'block_id': b.get('block_id', i),
+                                        'type': b_type,
+                                        'bbox': [x_min, y_min, x_max, y_max],
+                                        'label': b.get('label', ''),
+                                    })
+                            except Exception:
+                                pass
+
+                        vlm_description_box.text = summary_text.strip()
+                        vlm_status_label.text = f'解析完了: {len(parsed_blocks)} 個の要素を検出しました．'
+
+                        preview_path = TEST_VLM_DIR / 'vlm_preview_result.png'
+                        if parsed_blocks:
+                            preview_im = draw_block_preview(img_p, parsed_blocks)
+                            preview_im.save(preview_path)
+                        else:
+                            shutil.copy(img_p, preview_path)
+
+                        ts = int(time.time() * 1000)
+                        vlm_preview_container.clear()
+
+                        badge_colors = {
+                            'image_subpart': ('bg-red-500/20 text-red-300 border-red-500/40', '注目要素'),
+                            'image': ('bg-amber-500/20 text-amber-300 border-amber-500/40', '画像・領域'),
+                            'text': ('bg-blue-500/20 text-blue-300 border-blue-500/40', 'テキスト'),
+                            'code_line': ('bg-cyan-500/20 text-cyan-300 border-cyan-500/40', 'コード/数式'),
+                        }
+
+                        with vlm_preview_container:
+                            ui.label('🎯 アライメントプレビュー & 検出要素一覧').classes('text-xs font-bold text-zinc-300 mt-2')
+
+                            with ui.row().classes('w-full items-start gap-4'):
+                                ui.image(f'{file_url(preview_path)}&ts={ts}').classes(
+                                    'w-full max-w-xl rounded-lg border border-zinc-700 shadow-md'
+                                )
+
+                                with ui.column().classes('grow min-w-[280px] max-w-md gap-2'):
+                                    ui.label('検出された要素一覧（バッジ対応）').classes('text-xs font-semibold text-zinc-400')
+
+                                    if not parsed_blocks:
+                                        ui.label('（バウンディングボックスは検出されませんでした）').classes('text-xs text-zinc-500 italic')
+                                    else:
+                                        with ui.column().classes('w-full gap-1.5 max-h-[450px] overflow-y-auto pr-1'):
+                                            for b in parsed_blocks:
+                                                bid = b.get('block_id')
+                                                label = b.get('label') or '名称なし'
+                                                btype = b.get('type', 'image_subpart')
+                                                style_cls, type_name = badge_colors.get(btype, badge_colors['image_subpart'])
+
+                                                with ui.row().classes(
+                                                    'w-full items-center justify-between p-2 rounded bg-zinc-900/90 '
+                                                    'border border-zinc-800 hover:border-zinc-700 transition-colors'
+                                                ):
+                                                    with ui.row().classes('items-center gap-2 grow'):
+                                                        ui.label(f'#{bid}').classes(
+                                                            f'text-xs font-bold font-mono px-2 py-0.5 rounded border {style_cls}'
+                                                        )
+                                                        ui.label(label).classes('text-xs text-zinc-200 font-medium break-all')
+
+                                                    ui.badge(type_name).props('outline').classes('text-[10px] text-zinc-400 shrink-0')
+
+                        vlm_blocks_container.clear()
+                        if parsed_blocks:
+                            with vlm_blocks_container:
+                                with ui.expansion('検出要素の生データ (JSON)', icon='code').classes('w-full max-w-3xl border border-zinc-800 rounded text-xs'):
+                                    ui.code(json.dumps(parsed_blocks, ensure_ascii=False, indent=2), language='json').classes('w-full bg-zinc-950')
+
+                        ui.notify('VLM 解析とプレビュー生成が完了しました．', type='positive')
+
+                    except Exception as err:
+                        vlm_status_label.text = '解析エラーが発生しました．'
+                        vlm_description_box.text = f'【エラー】\n{err}'
+                        ui.notify(f'VLM テストに失敗しました: {err}', type='negative')
+                    finally:
+                        vlm_run_btn.enable()
+
+                vlm_run_btn.on_click(run_vlm_test)
 
         return llm_base, llm_key, llm_model_select, llm_temp
 
@@ -1836,6 +2068,9 @@ class SlideNarratorApp:
         ui.dark_mode().enable()
         ui.colors(primary='#3b82f6')
 
+        current_username = app.storage.user.get('username', '')
+        is_guest = (current_username == 'guest')
+
         def logout() -> None:
             app.storage.user.clear()
             ui.navigate.to('/login')
@@ -1914,7 +2149,8 @@ class SlideNarratorApp:
                 tab_simple_edit = ui.tab('📋 ナレーション修正（簡易）')
                 tab_edit = ui.tab('📝 ナレーション修正（詳細）')
                 tab_slide_videos = ui.tab('🎞 ビデオデッキ')
-                tab_settings = ui.tab('⚙ 設定')
+                if not is_guest:
+                    tab_settings = ui.tab('⚙ 設定')
                 tab_logs = ui.tab('📜 ログ')
 
             with ui.tab_panels(tabs, value=tab_gallery).classes('w-full'):
@@ -1929,8 +2165,9 @@ class SlideNarratorApp:
                 with ui.tab_panel(tab_slide_videos):
                     ui.label('🎞 ビデオデッキ').classes('text-h5')
                     self.slide_video_gallery = ui.column().classes('w-full')
-                with ui.tab_panel(tab_settings):
-                    self.settings_container = ui.column().classes('w-full')
+                if not is_guest:
+                    with ui.tab_panel(tab_settings):
+                        self.settings_container = ui.column().classes('w-full')
                 with ui.tab_panel(tab_logs):
                     with ui.row().classes('w-full items-center justify-between pb-2'):
                         ui.label('📜 実行ログ履歴').classes('text-h5')
@@ -1940,7 +2177,8 @@ class SlideNarratorApp:
                         for line in self.log.splitlines():
                             self.history_log_widget.push(line)
 
-        self.refresh_settings()
+        if not is_guest:
+            self.refresh_settings()
 
     def _mode_changed(self, value: str) -> None:
         self.mode_code = value
@@ -2006,4 +2244,4 @@ def login_page():
         ui.button('ログイン', on_click=try_login).props('color=primary').classes('w-full mt-2')
 
 
-ui.run(title='Slide Narrator', reload=False, show=False, port=17171, host='0.0.0.0', storage_secret='slide-narrator-session-secret-key-change-in-prod')
+ui.run(title='Slide Narrator', reload=True, show=False, port=17171, host='0.0.0.0', storage_secret='slide-narrator-session-secret-key-change-in-prod')
