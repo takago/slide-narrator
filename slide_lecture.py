@@ -135,16 +135,21 @@ Return ONLY a JSON array:
 ]
 """
 
+VLM_BBOX_COORD_MAX = 1000.0
+VLM_BBOX_FORMAT = "[xmin, ymin, xmax, ymax]"
+
+
 DETECT_IMAGE_PARTS_SYSTEM_JA = """あなたはスライド内の図・グラフ・チャートを詳細に解析するアシスタントです．
 スライド画像内の図表・グラフ・イラストに含まれる主要な構成要素（図形部品，数式，テキスト説明文，凡例，データ系列，軸，ノードなど）を検出し，
-それぞれの種別（kind: "text" または "graphic"）と，0から1000に正規化された座標 [ymin, xmin, ymax, xmax] を抽出してください．
-※必ず縦方向(y)が先、横方向(x)が後です（0が上/左端、1000が下/右端）．
+それぞれの種別（kind: "text" または "graphic"）と，0から1000に正規化された座標 [xmin, ymin, xmax, ymax] を抽出してください．
+※必ず横方向(x)が先、縦方向(y)が後です（0が左/上端、1000が右/下端）．
 
 種別の判定基準：
 - "text": 図中に埋め込まれた数式，文章，説明文，キーワード，ラベルなど（文字情報）
 - "graphic": 図形，ブロック，グラフの棒・折れ線，ノード枠，イラスト，アイコンなど（非テキストの視覚要素）
 
 必ず以下の形式のJSON配列のみを返してください：
+※各 bbox は必ず4個の数値を含め，末尾に余分なカンマを付けないでください．
 [
   {"name": "提案モデルの構成ブロック", "kind": "graphic", "bbox": [150, 100, 350, 400]},
   {"name": "損失関数の定義式", "kind": "text", "bbox": [420, 120, 480, 500]},
@@ -155,10 +160,10 @@ DETECT_IMAGE_PARTS_SYSTEM_JA = """あなたはスライド内の図・グラフ�
 DETECT_IMAGE_PARTS_SYSTEM_EN = """You are an assistant analyzing diagrams, charts, and figures inside presentation slides.
 Detect individual visual sub-components inside figures/charts (shapes, equations, text explanations, legends, bars/lines, nodes, etc.),
 classify their kind ("text" for equations/labels/sentences, "graphic" for shapes/bars/icons/diagrams),
-and output their bounding boxes in normalized coordinates (0 to 1000): [ymin, xmin, ymax, xmax].
-Note: y coordinates come first, x coordinates come second (0 is top/left, 1000 is bottom/right).
+and output their bounding boxes in normalized coordinates (0 to 1000): [xmin, ymin, xmax, ymax].
+Note: x coordinates come first, y coordinates come second (0 is left/top, 1000 is right/bottom).
 
-Return ONLY a JSON array:
+Return ONLY a JSON array. Each bbox must contain exactly four numeric values, with no trailing commas.
 [
   {"name": "Loss formula", "kind": "text", "bbox": [420, 120, 480, 500]},
   {"name": "Encoder module", "kind": "graphic", "bbox": [150, 100, 350, 400]}
@@ -474,34 +479,30 @@ def extract_page_blocks(pdf: Path, page_index: int, dpi: int) -> list[dict]:
 # =====================================================================
 
 def parse_vlm_bounding_box(raw_box: Any, img_w: int, img_h: int) -> list[int] | None:
-    """[ymin, xmin, ymax, xmax] 形式の座標を実ピクセル [xmin, ymin, xmax, ymax] に変換・クランプします．
-    
-    0〜1の小数正規化、0〜1000の正規化、実ピクセル直接指定のいずれにも対応します．
+    """0〜1000の正規化 [xmin, ymin, xmax, ymax] を実ピクセル [xmin, ymin, xmax, ymax] に変換・クランプします．
+
+    Qwen系VLMのバウンディングボックス出力は，ここでは常に0〜1000の正規化座標として扱います．
+    座標順序は [xmin, ymin, xmax, ymax]（XYXY）で統一します．
     """
     if not isinstance(raw_box, (list, tuple)) or len(raw_box) != 4:
         return None
 
     try:
-        vals = [float(v) for v in raw_box]
+        xmin_norm, ymin_norm, xmax_norm, ymax_norm = [float(v) for v in raw_box]
     except (ValueError, TypeError):
         return None
 
-    max_v = max(vals)
-    # スケール判定 (0〜1小数, 0〜1000正規化, 実ピクセル直値)
-    if max_v <= 1.0:
-        ymin_norm, xmin_norm, ymax_norm, xmax_norm = vals
-        scale_w, scale_h = float(img_w), float(img_h)
-    elif max_v <= 1000.0 and (img_w > 1000 or img_h > 1000 or max_v > min(img_w, img_h)):
-        ymin_norm, xmin_norm, ymax_norm, xmax_norm = vals
-        scale_w, scale_h = img_w / 1000.0, img_h / 1000.0
-    else:
-        ymin_norm, xmin_norm, ymax_norm, xmax_norm = vals
-        scale_w, scale_h = 1.0, 1.0
+    # Qwen系VLMのbboxは0〜1000の正規化座標として扱う．
+    # モデルが1000をわずかに超えて出力した場合も，画像範囲への変換前にクランプする．
+    xmin_norm = max(0.0, min(VLM_BBOX_COORD_MAX, xmin_norm))
+    ymin_norm = max(0.0, min(VLM_BBOX_COORD_MAX, ymin_norm))
+    xmax_norm = max(0.0, min(VLM_BBOX_COORD_MAX, xmax_norm))
+    ymax_norm = max(0.0, min(VLM_BBOX_COORD_MAX, ymax_norm))
 
-    px_x0 = int(round(xmin_norm * scale_w))
-    px_x1 = int(round(xmax_norm * scale_w))
-    px_y0 = int(round(ymin_norm * scale_h))
-    px_y1 = int(round(ymax_norm * scale_h))
+    px_x0 = int(round(xmin_norm * img_w / VLM_BBOX_COORD_MAX))
+    px_x1 = int(round(xmax_norm * img_w / VLM_BBOX_COORD_MAX))
+    px_y0 = int(round(ymin_norm * img_h / VLM_BBOX_COORD_MAX))
+    px_y1 = int(round(ymax_norm * img_h / VLM_BBOX_COORD_MAX))
 
     xmin = max(0, min(img_w, min(px_x0, px_x1)))
     xmax = max(0, min(img_w, max(px_x0, px_x1)))
@@ -521,7 +522,7 @@ def run_vlm_element_detection(
     prompt: str,
     system_prompt: str | None = None,
     temperature: float = 0.2,
-    max_tokens: int = 4000,
+    max_tokens: int = 2000,
 ) -> tuple[str, list[dict]]:
     """任意の画像に対してVLMへ問い合わせを行い、要約テキストとパース済みブロック一覧を返します．"""
     if not image_path.exists():
@@ -617,9 +618,9 @@ def detect_visual_elements_with_vlm(
     sys_prompt = DETECT_IMAGE_PARTS_SYSTEM_JA if lang == "ja" else DETECT_IMAGE_PARTS_SYSTEM_EN
     user_instruction = (
         "スライド画像内の図表・グラフに含まれる構成要素（部品・数式・テキスト・凡例・ノードなど）を検出し，"
-        "種別 kind ('text' または 'graphic') と 0〜1000に正規化した座標 [ymin, xmin, ymax, xmax] で出力してください．"
+        f"種別 kind ('text' または 'graphic') と 0〜1000に正規化した座標 {VLM_BBOX_FORMAT} で出力してください．"
         if lang == "ja"
-        else "Detect visual components (parts, formulas, text, legends, nodes), their kind ('text' or 'graphic'), and normalized coordinates (0-1000): [ymin, xmin, ymax, xmax]."
+        else f"Detect visual components (parts, formulas, text, legends, nodes), their kind ('text' or 'graphic'), and normalized coordinates (0-1000): {VLM_BBOX_FORMAT}."
     )
 
     try:
@@ -630,7 +631,7 @@ def detect_visual_elements_with_vlm(
             prompt=user_instruction,
             system_prompt=sys_prompt,
             temperature=0.0,
-            max_tokens=5000,
+            max_tokens=2000,
         )
         return sub_elements
     except Exception as e:
@@ -849,6 +850,51 @@ def image_data_url(path: Path) -> str:
     return f"data:{mime};base64,{data}"
 
 
+def _remove_json_trailing_commas(text: str) -> str:
+    """JSON文字列中の，配列・オブジェクト直前にある末尾カンマだけを除去します．
+
+    VLMが ``[1, 2, 3, ]`` や ``{"a": 1, }`` のようなJSONを返すことがあるため，
+    json.loads() の前にこの限定的な修復を行います．文字列リテラル内部は変更しません．
+    """
+    result: list[str] = []
+    in_string = False
+    escaped = False
+    i = 0
+
+    while i < len(text):
+        ch = text[i]
+
+        if in_string:
+            result.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            i += 1
+            continue
+
+        if ch == '"':
+            in_string = True
+            result.append(ch)
+            i += 1
+            continue
+
+        if ch == ',':
+            j = i + 1
+            while j < len(text) and text[j].isspace():
+                j += 1
+            if j < len(text) and text[j] in ']}':
+                i = j
+                continue
+
+        result.append(ch)
+        i += 1
+
+    return ''.join(result)
+
+
 def extract_json(text: str) -> dict | list:
     text = text.strip()
     if text.startswith("```"):
@@ -866,10 +912,18 @@ def extract_json(text: str) -> dict | list:
 
     if start_brace != -1 and (start_bracket == -1 or start_brace < start_bracket):
         end = text.rfind("}")
-        return json.loads(text[start_brace:end + 1])
+        json_text = text[start_brace:end + 1]
     else:
         end = text.rfind("]")
-        return json.loads(text[start_bracket:end + 1])
+        json_text = text[start_bracket:end + 1]
+
+    try:
+        return json.loads(json_text)
+    except json.JSONDecodeError as first_error:
+        repaired_text = _remove_json_trailing_commas(json_text)
+        if repaired_text == json_text:
+            raise first_error
+        return json.loads(repaired_text)
 
 
 def align_narration_with_blocks(

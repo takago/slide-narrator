@@ -44,6 +44,8 @@ from slide_lecture import (
     make_client,
     parse_page_ranges,
     run_vlm_element_detection,
+    VLM_BBOX_COORD_MAX,
+    VLM_BBOX_FORMAT,
     save_project_json,
 )
 from tts_filter import (
@@ -1273,9 +1275,9 @@ class SlideNarratorApp:
                             res = client.chat.completions.create(
                                 model=selected_model,
                                 temperature=float(llm_temp.value or 0.3),
-                                max_tokens=5000,
+                                max_tokens=4000,
                                 messages=[{'role': 'user', 'content': prompt}],
-                                extra_body={"reasoning_effort":"none"}, 
+                                extra_body={"reasoning_effort": "none"},
                             )
                             return res.choices[0].message.content or '（空の応答でした）'
 
@@ -1361,10 +1363,11 @@ class SlideNarratorApp:
                             '{\n'
                             '  "summary": "画像の説明文",\n'
                             '  "blocks": [\n'
-                            '    {"block_id": 1, "type": "image_subpart", "label": "要素名（例: 猫, 人物, タイトル文字列など）", "bbox": [ymin, xmin, ymax, xmax]}\n'
+                            f'    {{"block_id": 1, "type": "image_subpart", "label": "要素名（例: 猫, 人物, タイトル文字列など）", "bbox": {VLM_BBOX_FORMAT}}}\n'
                             '  ]\n'
                             '}\n'
-                            "※ bbox は [ymin, xmin, ymax, xmax] の順で、0〜1000 の正規化座標（縦の割合がymin/ymax、横の割合がxmin/xmax）で出力してください。\n"
+                            f"※ bbox は {VLM_BBOX_FORMAT} の順で、0〜{VLM_BBOX_COORD_MAX:g} の正規化座標（横の割合がxmin/xmax、縦の割合がymin/ymax）で出力してください。\n"
+                            "※ bbox は必ず4個の数値を指定してください。値を省略したり、末尾に余分なカンマを付けたりしないでください。\n"
                             "※ type は 'image_subpart'（注目物体・図形）, 'text'（文字領域）, 'image'（大きな領域）, 'code_line'（コードや数式）のいずれかを指定してください。"
                         )
 
