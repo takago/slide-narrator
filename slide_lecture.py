@@ -1122,20 +1122,14 @@ def generate_single_alignment(
     text: str,
     dpi: int,
     lang: str,
-    visual_mode: str = "auto",
+    visual_mode: str = "vlm",
 ) -> dict:
     blocks = extract_page_blocks(pdf, page_num - 1, dpi)
-    image_blocks = [b for b in blocks if b["type"] == "image"]
 
-    should_run_vlm = False
-    if visual_mode == "vlm":
-        should_run_vlm = True
-    elif visual_mode == "auto":
-        should_run_vlm = bool(image_blocks)
-    elif visual_mode == "pdf":
-        should_run_vlm = False
+    # 2モード判定: visual_mode が "vlm"（または True）の場合のみVLM併用
+    use_vlm = visual_mode in ("vlm", True, "true")
 
-    if should_run_vlm:
+    if use_vlm:
         sub_elements = detect_visual_elements_with_vlm(client, cfg, image_path, lang=lang)
         for elem in sub_elements:
             elem["block_id"] = len(blocks)
@@ -1158,7 +1152,7 @@ def generate_single_alignment(
 
     return {
         "page": page_num,
-        "visual_mode": visual_mode,
+        "visual_mode": "vlm" if use_vlm else "pdf",
         "blocks": blocks,
         "alignments": alignments,
     }
@@ -1281,7 +1275,7 @@ def generate_alignments(
     force: bool,
     lang: str = "ja",
     active_pages: set[int] | None = None,
-    default_visual_mode: str = "auto",
+    default_visual_mode: str = "vlm",
     page_visual_modes: dict[str, str] | None = None,
 ) -> None:
     client = make_client(cfg)
@@ -1306,7 +1300,8 @@ def generate_alignments(
             continue
 
         vmode = page_visual_modes.get(str(i), default_visual_mode)
-        emit_progress("align", k, len(active_indices), page=i, message=f"スライド {i}（{k}/{len(active_indices)}, 方式:{vmode}）")
+        mode_label = "VLM併用" if vmode == "vlm" else "PDF基準"
+        emit_progress("align", k, len(active_indices), page=i, message=f"スライド {i}（{k}/{len(active_indices)}, {mode_label}）")
         print(f"[ALIGN] 字幕＆ポインタ解析: page {i}/{len(images)} (visual_mode={vmode})")
         raw_text = text_file.read_text(encoding="utf-8").strip()
         align_data = generate_single_alignment(client, cfg, pdf, i, image, raw_text, dpi, lang, visual_mode=vmode)
@@ -1740,9 +1735,9 @@ def main() -> int:
     parser.add_argument("--skip-pages", type=str, default=None, help="除外スライド番号または範囲（例: '5,11-13'）")
     parser.add_argument(
         "--visual-mode",
-        choices=["auto", "vlm", "pdf"],
+        choices=["vlm", "pdf"],
         default=None,
-        help="図表要素の検出方式 (auto: 埋め込み画像のみ対象, vlm: 常に画像全体から検出, pdf: VLM検出を無効化)",
+        help="ポインタ決定方式 (vlm: VLM併用で図内要素も検出, pdf: PDF構造のみ使用)",
     )
     args = parser.parse_args()
 
@@ -1764,11 +1759,8 @@ def main() -> int:
         if args.skip_pages is not None
         else proj_cfg.get("skip_pages", "")
     )
-    visual_mode = (
-        args.visual_mode
-        or proj_cfg.get("visual_mode")
-        or cfg.get("visual_mode", "auto")
-    )
+    raw_vmode = args.visual_mode or proj_cfg.get("visual_mode") or cfg.get("visual_mode", "vlm")
+    visual_mode = "vlm" if raw_vmode in ("vlm", "auto", True, "true") else "pdf"
     page_visual_modes = proj_cfg.get("slide_visual_modes", {})
 
     proj_cfg.update({
