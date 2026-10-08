@@ -521,7 +521,7 @@ def run_vlm_element_detection(
     prompt: str,
     system_prompt: str | None = None,
     temperature: float = 0.2,
-    max_tokens: int = 2000,
+    max_tokens: int = 4000,
 ) -> tuple[str, list[dict]]:
     """任意の画像に対してVLMへ問い合わせを行い、要約テキストとパース済みブロック一覧を返します．"""
     if not image_path.exists():
@@ -630,7 +630,7 @@ def detect_visual_elements_with_vlm(
             prompt=user_instruction,
             system_prompt=sys_prompt,
             temperature=0.0,
-            max_tokens=2000,
+            max_tokens=5000,
         )
         return sub_elements
     except Exception as e:
