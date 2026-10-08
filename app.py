@@ -279,7 +279,7 @@ class SlideNarratorApp:
         self.proj_cfg: dict[str, Any] = {}
         self.mode_code = 'lecture'
         self.lang_code = 'ja'
-        self.default_visual_mode = 'auto'
+        self.default_use_vlm: bool = True
         self.slide_visual_modes: dict[str, str] = {}
         self.force_run = False
         self.edit_page: int | None = None
@@ -304,7 +304,7 @@ class SlideNarratorApp:
         self.settings_container = None
         self.mode_select = None
         self.lang_select = None
-        self.default_visual_mode_select = None
+        self.default_vlm_switch = None
         self.pages_input = None
         self.force_checkbox = None
         self.pipeline_buttons = []
@@ -397,7 +397,9 @@ class SlideNarratorApp:
             self.proj_cfg = load_project_json(self.paths.root)
             self.mode_code = self.proj_cfg.get('mode') or self.cfg.get('mode', 'lecture')
             self.lang_code = self.proj_cfg.get('language') or self.cfg.get('language', 'ja')
-            self.default_visual_mode = self.proj_cfg.get('visual_mode') or self.cfg.get('visual_mode', 'auto')
+
+            saved_vmode = self.proj_cfg.get('visual_mode') or self.cfg.get('visual_mode', 'vlm')
+            self.default_use_vlm = saved_vmode in ('vlm', 'auto', True, 'true')
             self.slide_visual_modes = self.proj_cfg.get('slide_visual_modes', {})
 
             self.images = await run.io_bound(
@@ -446,8 +448,8 @@ class SlideNarratorApp:
             self.mode_select.value = self.mode_code
         if self.lang_select:
             self.lang_select.value = self.lang_code
-        if self.default_visual_mode_select:
-            self.default_visual_mode_select.value = self.default_visual_mode
+        if self.default_vlm_switch:
+            self.default_vlm_switch.value = self.default_use_vlm
         if self.pages_input:
             self.pages_input.value = self.pages_spec
         if self.active_count_label:
@@ -461,7 +463,7 @@ class SlideNarratorApp:
             'language': self.lang_code,
             'pages': self.pages_spec,
             'skip_pages': '',
-            'visual_mode': self.default_visual_mode,
+            'visual_mode': 'vlm' if self.default_use_vlm else 'pdf',
             'slide_visual_modes': self.slide_visual_modes,
         })
         save_project_json(self.paths.root, self.proj_cfg)
@@ -598,7 +600,7 @@ class SlideNarratorApp:
         args = [
             '--mode', self.mode_code,
             '--lang', self.lang_code,
-            '--visual-mode', self.default_visual_mode,
+            '--visual-mode', 'vlm' if self.default_use_vlm else 'pdf',
         ]
         if self.force_run:
             args.append('--force')
@@ -794,7 +796,7 @@ class SlideNarratorApp:
             self.set_processing(False)
             dialog.close()
 
-    async def save_and_realign(self, page: int, text: str, page_mode: str | None = None) -> None:
+    async def save_and_realign(self, page: int, text: str, page_use_vlm: bool | None = None) -> None:
         if not self.pdf or not self.paths:
             return
         ep = self.paths.explanation(page)
@@ -803,19 +805,25 @@ class SlideNarratorApp:
         temp_ep.write_text(text.rstrip() + '\n', encoding='utf-8')
         temp_ep.replace(ep)
 
-        mode_to_use = page_mode or self.slide_visual_modes.get(str(page), self.default_visual_mode)
-        self.slide_visual_modes[str(page)] = mode_to_use
+        # ページ固有のVLM併用フラグを保存
+        if page_use_vlm is not None:
+            mode_str = 'vlm' if page_use_vlm else 'pdf'
+        else:
+            mode_str = self.slide_visual_modes.get(str(page), 'vlm' if self.default_use_vlm else 'pdf')
+
+        self.slide_visual_modes[str(page)] = mode_str
         self.save_project_settings()
 
         if self.processing:
             ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
             return
+        mode_label = "VLM併用" if mode_str == 'vlm' else "PDF基準"
         dialog, update_status, push_log = self.open_processing_dialog(f'スライド {page} の要素抽出と視線誘導を再解析中…')
         self.set_processing(True)
         self.current_task = asyncio.current_task()
         try:
-            update_status(f'要素抽出（方式:{mode_to_use}）と対訳・視線誘導を再計算中…', 0.5, current_page=page)
-            push_log(f'[ALIGN] スライド {page} の要素抽出 (visual_mode={mode_to_use}) と視線誘導を再計算中...')
+            update_status(f'要素抽出（{mode_label}）と対訳・視線誘導を再計算中…', 0.5, current_page=page)
+            push_log(f'[ALIGN] スライド {page} の要素抽出 ({mode_label}) と視線誘導を再計算中...')
             await asyncio.sleep(0.01)
             client = await run.io_bound(make_client, self.cfg['llm'])
             dpi = int(self.cfg.get('pdf', {}).get('dpi', 150))
@@ -823,7 +831,7 @@ class SlideNarratorApp:
                 generate_single_alignment,
                 client, self.cfg['llm'], self.pdf, page,
                 self.paths.page_image(page), text.strip(), dpi, self.lang_code,
-                visual_mode=mode_to_use,
+                visual_mode=mode_str,
             )
 
             if not self.cancellation_requested:
@@ -837,7 +845,7 @@ class SlideNarratorApp:
                 update_status('完了しました！', 1.0, current_page=page)
                 push_log(f'[ALIGN] 完了: 字幕・ポインタアライメントを保存しました')
                 await asyncio.sleep(0.3)
-                ui.notify(f'スライド {page} の字幕とポインタを再生成しました（方式: {mode_to_use}）．', type='positive')
+                ui.notify(f'スライド {page} の字幕とポインタを再生成しました（{mode_label}）．', type='positive')
                 await self.refresh_simple_editor()
                 await self.refresh_editor()
         except asyncio.CancelledError:
@@ -1015,7 +1023,9 @@ class SlideNarratorApp:
         img = self.paths.page_image(page)
         current_text_path = self.paths.explanation(page)
         current_text = current_text_path.read_text(encoding='utf-8') if current_text_path.exists() else ''
-        page_current_vmode = self.slide_visual_modes.get(str(page), self.default_visual_mode)
+
+        page_vmode = self.slide_visual_modes.get(str(page), 'vlm' if self.default_use_vlm else 'pdf')
+        page_use_vlm_init = (page_vmode == 'vlm')
 
         with self.edit_container:
             with ui.row().classes('w-full items-center justify-between pb-2'):
@@ -1030,16 +1040,13 @@ class SlideNarratorApp:
                     ui.button('◀ 前', on_click=self.prev_edit).props(f'disable={idx == 0} outlined dense')
                     ui.button('次 ▶', on_click=self.next_edit).props(f'disable={idx == len(self.active_pages)-1} outlined dense')
 
-                with ui.row().classes('items-center gap-2 p-1.5 bg-zinc-900 border border-zinc-800 rounded-lg'):
-                    ui.label('このスライドの検出方式:').classes('text-xs text-zinc-400')
-                    page_vmode_radio = ui.radio(
-                        {
-                            'auto': '🤖 自動',
-                            'vlm': '👁 VLM探索',
-                            'pdf': '⚡ PDFのみ',
-                        },
-                        value=page_current_vmode,
-                    ).props('inline dense')
+                # スライド個別トグル
+                with ui.row().classes('items-center gap-2 p-1 px-3 bg-zinc-900 border border-zinc-800 rounded-lg'):
+                    page_vlm_switch = ui.switch(
+                        'VLMを活用してポインタ配置を決定する',
+                        value=page_use_vlm_init,
+                    ).props('dense color=primary')
+                    page_vlm_switch.tooltip('ONにすると図やグラフ・数式の内部要素まで細かくポインティングします．OFFにするとPDFテキストのみを使用します．')
 
             with ui.row().classes('w-full items-start gap-6'):
                 with ui.column().classes('w-5/12 gap-3'):
@@ -1090,7 +1097,7 @@ class SlideNarratorApp:
                         ui.button('✨ ナレーションを再生成',
                                   on_click=lambda: self.regenerate_narration(page, text_area)).classes('grow').props('outline')
                         ui.button('🔄 保存して字幕・ポインタを再解析',
-                                  on_click=lambda: self.save_and_realign(page, text_area.value, page_vmode_radio.value)).classes('grow').props('color=primary')
+                                  on_click=lambda: self.save_and_realign(page, text_area.value, page_vlm_switch.value)).classes('grow').props('color=primary')
 
                     if alignments:
                         ui.separator()
@@ -1867,16 +1874,13 @@ class SlideNarratorApp:
             self.lang_select = ui.radio({'ja': '🇯🇵 日本語', 'en': '🇺🇸 英語'}, value=self.lang_code).props('inline')
             self.lang_select.on_value_change(lambda e: self._lang_changed(e.value))
 
-            ui.label('既定の図表検出方式').classes('text-caption text-zinc-400 mt-2')
-            self.default_visual_mode_select = ui.radio(
-                {
-                    'auto': '🤖 自動（埋め込み基準）',
-                    'vlm': '👁 全スライドVLM探索',
-                    'pdf': '⚡ PDF構造のみ',
-                },
-                value=self.default_visual_mode,
-            ).props('dense')
-            self.default_visual_mode_select.on_value_change(lambda e: self._default_visual_mode_changed(e.value))
+            with ui.card().classes('w-full p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg mt-2'):
+                self.default_vlm_switch = ui.switch(
+                    'VLMを活用してポインタ配置を決定する',
+                    value=self.default_use_vlm,
+                ).props('dense color=primary')
+                self.default_vlm_switch.tooltip('ONにすると図形・数式・グラフの内部要素まで細かくポインティングします．OFFにするとPDFテキストのみを使用します．')
+                self.default_vlm_switch.on_value_change(lambda e: self._default_vlm_changed(e.value))
 
             self.pages_input = (
                 ui.input('ビデオ化対象', placeholder='例: 1-10,12', value=self.pages_spec)
@@ -1948,8 +1952,8 @@ class SlideNarratorApp:
         asyncio.create_task(self.refresh_simple_editor())
         asyncio.create_task(self.refresh_editor())
 
-    def _default_visual_mode_changed(self, value: str) -> None:
-        self.default_visual_mode = value
+    def _default_vlm_changed(self, value: bool) -> None:
+        self.default_use_vlm = bool(value)
         self.save_project_settings()
 
     def _range_changed(self) -> None:
