@@ -180,13 +180,24 @@ def ensure_page_images(paths: ProjectPaths, dpi: int = 120) -> list[Path]:
 def draw_block_preview(img_path: Path, blocks: list[dict]) -> Image.Image:
     im = Image.open(img_path).convert('RGB')
     draw = ImageDraw.Draw(im)
+
+    color_map = {
+        'image_subpart': ('#ef4444', 3),  # 赤色: VLM検出要素（太枠）
+        'image': ('#f59e0b', 2),          # 橙色: 画像領域全体
+        'text': ('#3b82f6', 2),           # 青色: 通常テキスト
+        'code_line': ('#06b6d4', 2),      # 水色: コード行
+    }
+
     for b in blocks:
         box = b.get('bbox')
         bid = b.get('block_id')
+        btype = b.get('type', 'text')
         if box:
-            draw.rectangle(box, outline='blue', width=2)
-            draw.rectangle([box[0], box[1] - 20, box[0] + 35, box[1]], fill='blue')
-            draw.text((box[0] + 4, box[1] - 18), f'#{bid}', fill='white')
+            color, width = color_map.get(btype, ('#3b82f6', 2))
+            draw.rectangle(box, outline=color, width=width)
+            badge_width = max(35, 12 + len(str(bid)) * 10)
+            draw.rectangle([box[0], max(0, box[1] - 20), box[0] + badge_width, box[1]], fill=color)
+            draw.text((box[0] + 4, max(0, box[1] - 18)), f'#{bid}', fill='white')
     return im
 
 
@@ -226,7 +237,6 @@ def file_url(path: Path) -> str:
 
 
 def _resolve_file(path: str) -> Path | None:
-    """Resolve a path below the application root, rejecting traversal."""
     root = Path.cwd().resolve()
     target = (root / path).resolve()
     if root not in target.parents and target != root:
@@ -269,15 +279,15 @@ class SlideNarratorApp:
         self.proj_cfg: dict[str, Any] = {}
         self.mode_code = 'lecture'
         self.lang_code = 'ja'
+        self.default_visual_mode = 'auto'
+        self.slide_visual_modes: dict[str, str] = {}
         self.force_run = False
         self.edit_page: int | None = None
         self.log = ''
         self.processing = False
 
-        # スライド選択状態の単一の真実（Single Source of Truth）
         self._selected_pages: set[int] = set()
 
-        # プロセスおよび非同期キャンセルの追跡
         self.current_process: asyncio.subprocess.Process | None = None
         self.current_task: asyncio.Task | None = None
         self.cancellation_requested = False
@@ -294,11 +304,10 @@ class SlideNarratorApp:
         self.settings_container = None
         self.mode_select = None
         self.lang_select = None
+        self.default_visual_mode_select = None
         self.pages_input = None
         self.force_checkbox = None
         self.pipeline_buttons = []
-
-    # ---- Slide state properties / helpers ------------------------------
 
     @property
     def total_slides(self) -> int:
@@ -363,30 +372,24 @@ class SlideNarratorApp:
         await self.refresh_editor()
         await self.refresh_slide_videos()
 
-    # ---- project ------------------------------------------------------
-
     async def load_pdf(self, e) -> None:
         filename = Path(e.file.name).name
         target_pdf = UPLOAD_DIR / filename
         target_paths = ProjectPaths(target_pdf)
 
-        # 一旦テンポラリファイルとして保存
         temp_pdf = UPLOAD_DIR / f".upload_{int(time.time())}_{filename}"
         await e.file.save(temp_pdf)
 
-        # 既存のプロジェクトフォルダまたはPDFファイルが存在するか判定
         has_existing_project = target_paths.root.exists() or target_pdf.exists()
 
         async def finalize_loading(delete_existing: bool) -> None:
             if delete_existing:
-                # 既存の出力フォルダ一式を削除
                 if target_paths.root.exists():
                     shutil.rmtree(target_paths.root, ignore_errors=True)
                 if target_pdf.exists():
                     target_pdf.unlink()
                 ui.notify(f'既存のプロジェクトデータを削除しました: {target_paths.root.name}', type='info')
 
-            # アップロードされたファイルを正式な場所に配置
             temp_pdf.replace(target_pdf)
 
             self.pdf = target_pdf
@@ -394,6 +397,8 @@ class SlideNarratorApp:
             self.proj_cfg = load_project_json(self.paths.root)
             self.mode_code = self.proj_cfg.get('mode') or self.cfg.get('mode', 'lecture')
             self.lang_code = self.proj_cfg.get('language') or self.cfg.get('language', 'ja')
+            self.default_visual_mode = self.proj_cfg.get('visual_mode') or self.cfg.get('visual_mode', 'auto')
+            self.slide_visual_modes = self.proj_cfg.get('slide_visual_modes', {})
 
             self.images = await run.io_bound(
                 ensure_page_images, self.paths, int(self.cfg.get('pdf', {}).get('dpi', 120))
@@ -407,7 +412,6 @@ class SlideNarratorApp:
             ui.notify(f'プレゼンテーションを読み込みました: {target_pdf.name}', type='positive')
 
         if has_existing_project:
-            # 削除確認ダイアログを表示
             with ui.dialog() as dialog, ui.card().classes('p-5 gap-4 max-w-md'):
                 dialog.props('persistent')
                 with ui.row().classes('items-center gap-2 text-warning'):
@@ -442,6 +446,8 @@ class SlideNarratorApp:
             self.mode_select.value = self.mode_code
         if self.lang_select:
             self.lang_select.value = self.lang_code
+        if self.default_visual_mode_select:
+            self.default_visual_mode_select.value = self.default_visual_mode
         if self.pages_input:
             self.pages_input.value = self.pages_spec
         if self.active_count_label:
@@ -455,6 +461,8 @@ class SlideNarratorApp:
             'language': self.lang_code,
             'pages': self.pages_spec,
             'skip_pages': '',
+            'visual_mode': self.default_visual_mode,
+            'slide_visual_modes': self.slide_visual_modes,
         })
         save_project_json(self.paths.root, self.proj_cfg)
 
@@ -476,18 +484,14 @@ class SlideNarratorApp:
         self._selected_pages = set()
         self._on_pages_updated(sync_input=True, save=True, refresh=True)
 
-    # ---- pipeline / process control -----------------------------------
-
     def open_processing_dialog(self, initial_title: str) -> tuple[ui.dialog, Callable[[str, float | None, str | None, int | None], None], Callable[[str], None]]:
         dialog = ui.dialog()
         dialog.props('persistent')
         self.cancellation_requested = False
 
         with dialog, ui.card().classes('items-center p-6 gap-3 min-w-[620px] max-w-[760px]'):
-            # 1. 見出し
             title_label = ui.label(initial_title).classes('text-base font-bold text-center text-zinc-100')
 
-            # 2. スライド画像
             slide_preview_row = ui.row().classes('w-full items-end justify-center gap-3 py-2')
             with slide_preview_row:
                 with ui.column().classes('items-center w-28 opacity-45'):
@@ -508,21 +512,16 @@ class SlideNarratorApp:
                         next_image = ui.image('').props('fit=contain').classes('w-full h-full rounded').style('display: none')
                         next_placeholder = ui.label('-').classes('text-xs text-zinc-500')
 
-            # 3. ラベル
             status_label = ui.label('準備中…').classes('text-sm text-zinc-400 text-center')
 
-            # 4. 進捗バー
             with ui.row().classes('w-full items-center gap-2'):
                 progress_bar = ui.linear_progress(value=0.0, show_value=False).props('rounded size=14px').classes('grow')
 
-            # 5. ログフォールド
             with ui.expansion('詳細ログを表示', icon='terminal').classes('w-full border border-zinc-700 rounded-lg text-xs mt-1'):
                 dialog_log = ui.log(max_lines=300).classes('w-full h-40 font-mono text-xs bg-zinc-900 text-zinc-300 p-2')
 
-            # 6. スピナー
             ui.spinner(size='md')
 
-            # 7. 中断ボタン
             with ui.row().classes('w-full justify-center pt-2'):
                 ui.button('処理を中断', on_click=self.request_cancel, color='negative').props('text-color=white')
 
@@ -596,7 +595,11 @@ class SlideNarratorApp:
             button.disable() if value else button.enable()
 
     def base_args(self) -> list[str]:
-        args = ['--mode', self.mode_code, '--lang', self.lang_code]
+        args = [
+            '--mode', self.mode_code,
+            '--lang', self.lang_code,
+            '--visual-mode', self.default_visual_mode,
+        ]
         if self.force_run:
             args.append('--force')
         spec = self.pages_spec.strip()
@@ -662,7 +665,6 @@ class SlideNarratorApp:
                 if self.history_log_widget:
                     self.history_log_widget.push(line)
 
-                # 構造化進捗イベント [PROGRESS] のみで確実にUI更新
                 if line.startswith('[PROGRESS]'):
                     try:
                         p_data = json.loads(line[10:].strip())
@@ -714,8 +716,6 @@ class SlideNarratorApp:
             self.current_process = None
             self.set_processing(False)
             dialog.close()
-
-    # ---- edit tab -----------------------------------------------------
 
     def alignment_data(self, page: int) -> tuple[dict, list[dict], list[dict]]:
         if not self.paths:
@@ -794,7 +794,7 @@ class SlideNarratorApp:
             self.set_processing(False)
             dialog.close()
 
-    async def save_and_realign(self, page: int, text: str) -> None:
+    async def save_and_realign(self, page: int, text: str, page_mode: str | None = None) -> None:
         if not self.pdf or not self.paths:
             return
         ep = self.paths.explanation(page)
@@ -803,15 +803,19 @@ class SlideNarratorApp:
         temp_ep.write_text(text.rstrip() + '\n', encoding='utf-8')
         temp_ep.replace(ep)
 
+        mode_to_use = page_mode or self.slide_visual_modes.get(str(page), self.default_visual_mode)
+        self.slide_visual_modes[str(page)] = mode_to_use
+        self.save_project_settings()
+
         if self.processing:
             ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
             return
-        dialog, update_status, push_log = self.open_processing_dialog('文分割・字幕翻訳・ポインタを再解析中…')
+        dialog, update_status, push_log = self.open_processing_dialog(f'スライド {page} の要素抽出と視線誘導を再解析中…')
         self.set_processing(True)
         self.current_task = asyncio.current_task()
         try:
-            update_status(f'スライド {page} の要素抽出と対訳・視線誘導を再計算中…', 0.5, current_page=page)
-            push_log(f'[ALIGN] スライド {page} の要素抽出と視線誘導を再計算中...')
+            update_status(f'要素抽出（方式:{mode_to_use}）と対訳・視線誘導を再計算中…', 0.5, current_page=page)
+            push_log(f'[ALIGN] スライド {page} の要素抽出 (visual_mode={mode_to_use}) と視線誘導を再計算中...')
             await asyncio.sleep(0.01)
             client = await run.io_bound(make_client, self.cfg['llm'])
             dpi = int(self.cfg.get('pdf', {}).get('dpi', 150))
@@ -819,6 +823,7 @@ class SlideNarratorApp:
                 generate_single_alignment,
                 client, self.cfg['llm'], self.pdf, page,
                 self.paths.page_image(page), text.strip(), dpi, self.lang_code,
+                visual_mode=mode_to_use,
             )
 
             if not self.cancellation_requested:
@@ -832,7 +837,7 @@ class SlideNarratorApp:
                 update_status('完了しました！', 1.0, current_page=page)
                 push_log(f'[ALIGN] 完了: 字幕・ポインタアライメントを保存しました')
                 await asyncio.sleep(0.3)
-                ui.notify('字幕とポインタを再生成しました（古い音声・動画をリセットしました）．', type='positive')
+                ui.notify(f'スライド {page} の字幕とポインタを再生成しました（方式: {mode_to_use}）．', type='positive')
                 await self.refresh_simple_editor()
                 await self.refresh_editor()
         except asyncio.CancelledError:
@@ -911,8 +916,6 @@ class SlideNarratorApp:
             self.current_task = None
             self.set_processing(False)
             dialog.close()
-
-    # ---- rendering ----------------------------------------------------
 
     async def refresh_gallery(self) -> None:
         if not self.gallery:
@@ -1012,18 +1015,31 @@ class SlideNarratorApp:
         img = self.paths.page_image(page)
         current_text_path = self.paths.explanation(page)
         current_text = current_text_path.read_text(encoding='utf-8') if current_text_path.exists() else ''
+        page_current_vmode = self.slide_visual_modes.get(str(page), self.default_visual_mode)
 
         with self.edit_container:
-            with ui.row().classes('w-full items-center gap-3 pb-2'):
-                sel = ui.select(
-                    {p: f'スライド {p} ({self.get_slide_order(p)} / {len(self.active_pages)} スライド)' for p in self.active_pages},
-                    value=page,
-                    label='編集スライド選択',
-                ).classes('min-w-[280px] max-w-[340px]').props('outlined dense')
-                sel.on_value_change(lambda e: asyncio.create_task(self.select_edit_page(e.value)))
+            with ui.row().classes('w-full items-center justify-between pb-2'):
+                with ui.row().classes('items-center gap-3'):
+                    sel = ui.select(
+                        {p: f'スライド {p} ({self.get_slide_order(p)} / {len(self.active_pages)} スライド)' for p in self.active_pages},
+                        value=page,
+                        label='編集スライド選択',
+                    ).classes('min-w-[280px] max-w-[340px]').props('outlined dense')
+                    sel.on_value_change(lambda e: asyncio.create_task(self.select_edit_page(e.value)))
 
-                ui.button('◀ 前のスライド', on_click=self.prev_edit).props(f'disable={idx == 0} outlined')
-                ui.button('次のスライド ▶', on_click=self.next_edit).props(f'disable={idx == len(self.active_pages)-1} outlined')
+                    ui.button('◀ 前', on_click=self.prev_edit).props(f'disable={idx == 0} outlined dense')
+                    ui.button('次 ▶', on_click=self.next_edit).props(f'disable={idx == len(self.active_pages)-1} outlined dense')
+
+                with ui.row().classes('items-center gap-2 p-1.5 bg-zinc-900 border border-zinc-800 rounded-lg'):
+                    ui.label('このスライドの検出方式:').classes('text-xs text-zinc-400')
+                    page_vmode_radio = ui.radio(
+                        {
+                            'auto': '🤖 自動',
+                            'vlm': '👁 VLM探索',
+                            'pdf': '⚡ PDFのみ',
+                        },
+                        value=page_current_vmode,
+                    ).props('inline dense')
 
             with ui.row().classes('w-full items-start gap-6'):
                 with ui.column().classes('w-5/12 gap-3'):
@@ -1032,10 +1048,21 @@ class SlideNarratorApp:
                         if preview is not None:
                             preview_path = self.paths.page_preview(page)
                             preview.save(preview_path)
-                            ui.image(file_url(preview_path)).classes('w-full rounded border border-zinc-700 shadow-sm')
+                            ts = int(time.time() * 1000)
+                            ui.image(f"{file_url(preview_path)}&ts={ts}").classes('w-full rounded border border-zinc-700 shadow-sm')
                         else:
                             ui.image(file_url(img)).classes('w-full rounded border border-zinc-700 shadow-sm')
-                        ui.label(f'スライド {page}').classes('text-sm text-gray-500 dark:text-gray-400')
+
+                        with ui.row().classes('w-full items-center justify-center gap-3 text-xs pt-1'):
+                            with ui.row().classes('items-center gap-1'):
+                                ui.element('div').classes('w-3 h-3 bg-red-500 rounded-sm')
+                                ui.label('赤: VLM画像内要素').classes('text-zinc-300')
+                            with ui.row().classes('items-center gap-1'):
+                                ui.element('div').classes('w-3 h-3 bg-amber-500 rounded-sm')
+                                ui.label('橙: 図全体').classes('text-zinc-300')
+                            with ui.row().classes('items-center gap-1'):
+                                ui.element('div').classes('w-3 h-3 bg-blue-500 rounded-sm')
+                                ui.label('青: テキスト/行').classes('text-zinc-300')
 
                     with ui.card().classes('w-full p-3 bg-zinc-900 border border-zinc-800 rounded-lg gap-2'):
                         ui.label('🔊 ナレーション音声').classes('text-sm font-bold text-zinc-200')
@@ -1059,11 +1086,11 @@ class SlideNarratorApp:
                         f'主言語ナレーション原稿（{main_lang}）',
                         value=current_text,
                     ).props('outlined').classes('w-full').style('min-height: 180px')
-                    with ui.row().classes('w-full'):
-                        ui.button('✨ 現在のスライドのナレーションを再生成',
-                                  on_click=lambda: self.regenerate_narration(page, text_area)).classes('grow')
+                    with ui.row().classes('w-full gap-2'):
+                        ui.button('✨ ナレーションを再生成',
+                                  on_click=lambda: self.regenerate_narration(page, text_area)).classes('grow').props('outline')
                         ui.button('🔄 保存して字幕・ポインタを再解析',
-                                  on_click=lambda: self.save_and_realign(page, text_area.value)).classes('grow')
+                                  on_click=lambda: self.save_and_realign(page, text_area.value, page_vmode_radio.value)).classes('grow').props('color=primary')
 
                     if alignments:
                         ui.separator()
@@ -1148,10 +1175,7 @@ class SlideNarratorApp:
             else:
                 ui.label('動画未生成').classes('text-xs text-zinc-500')
 
-    # ---- settings (modularized into structured cards) -----------------
-
     def _build_llm_settings(self) -> tuple[ui.input, ui.input, ui.select, ui.number]:
-        """LLM設定カードおよび接続テストを構築します"""
         with ui.card().classes('w-full p-5 bg-zinc-900 border border-zinc-800 rounded-xl gap-4 shadow-sm'):
             with ui.row().classes('w-full items-center justify-between border-b border-zinc-800 pb-2'):
                 with ui.row().classes('items-center gap-2'):
@@ -1257,7 +1281,6 @@ class SlideNarratorApp:
 
     @staticmethod
     def _fetch_voices_from_server(base_url: str, api_key: str) -> list[str]:
-        """TTSサーバからボイス/話者一覧の取得を試行します"""
         url_clean = base_url.rstrip('/')
         candidate_urls = [
             f"{url_clean}/audio/voices",
@@ -1304,12 +1327,10 @@ class SlideNarratorApp:
         return []
 
     def _build_tts_settings(self) -> tuple[tuple[ui.input, ui.input, ui.select, ui.select], tuple[ui.input, ui.input, ui.select, ui.select]]:
-        """日英TTS設定カードおよび音声再生テストを構築します"""
         tts = self.cfg.setdefault('tts', {})
         ja = tts.setdefault('ja', {})
         en = tts.setdefault('en', {})
 
-        # --- 日本語 TTS カード ---
         with ui.card().classes('w-full p-5 bg-zinc-900 border border-zinc-800 rounded-xl gap-4 shadow-sm mt-2'):
             with ui.row().classes('w-full items-center justify-between border-b border-zinc-800 pb-2'):
                 with ui.row().classes('items-center gap-2'):
@@ -1454,7 +1475,6 @@ class SlideNarratorApp:
 
             ja_test_btn.on_click(run_ja_tts_test)
 
-        # --- 英語 TTS カード ---
         with ui.card().classes('w-full p-5 bg-zinc-900 border border-zinc-800 rounded-xl gap-4 shadow-sm mt-2'):
             with ui.row().classes('w-full items-center justify-between border-b border-zinc-800 pb-2'):
                 with ui.row().classes('items-center gap-2'):
@@ -1600,13 +1620,11 @@ class SlideNarratorApp:
         return (ja_base, ja_key, ja_model_select, ja_voice_select), (en_base, en_key, en_model_select, en_voice_select)
 
     def _build_dict_editor(self) -> None:
-        """tts_filter.yaml の設定カードおよび単語辞書編集UIを構築します"""
         filter_cfg = load_tts_filter_config(TTS_FILTER_PATH) if TTS_FILTER_PATH.exists() else {}
         server_cfg = filter_cfg.setdefault('server', {})
         gen_cfg = filter_cfg.setdefault('generation', {})
         filter_dict = filter_cfg.setdefault('dictionary', {})
 
-        # --- フィルタ設定カード ---
         with ui.card().classes('w-full p-5 bg-zinc-900 border border-zinc-800 rounded-xl gap-4 shadow-sm mt-4'):
             with ui.row().classes('w-full items-center justify-between border-b border-zinc-800 pb-2'):
                 with ui.row().classes('items-center gap-2'):
@@ -1656,7 +1674,6 @@ class SlideNarratorApp:
 
             filter_fetch_btn.on_click(fetch_filter_models)
 
-            # --- ヨミ変換テスト実行機能 ---
             with ui.card().classes('w-full p-3 bg-zinc-950 border border-zinc-800 rounded-lg gap-2'):
                 ui.label('🧪 ヨミ変換フィルタ リアルタイムテスト').classes('text-xs font-bold text-zinc-300')
                 with ui.row().classes('w-full items-center gap-2'):
@@ -1710,7 +1727,6 @@ class SlideNarratorApp:
 
                 filter_test_btn.on_click(run_filter_test)
 
-            # --- 単語辞書編集 ---
             ui.separator().classes('my-2 border-zinc-800')
             with ui.row().classes('w-full items-center justify-between'):
                 ui.label('📖 読み仮名辞書の編集').classes('text-base font-bold text-zinc-200')
@@ -1767,7 +1783,6 @@ class SlideNarratorApp:
             ui.button('💾 ヨミ変換設定・辞書 (tts_filter.yaml) を保存', on_click=save_filter_configuration).props('dense outline color=emerald').classes('w-full')
 
     def refresh_settings(self) -> None:
-        """設定タブ全体の構築（構造化カードを順次配置）"""
         if not self.settings_container:
             return
         self.settings_container.clear()
@@ -1805,13 +1820,9 @@ class SlideNarratorApp:
 
             self._build_dict_editor()
 
-    # ---- global refresh ----------------------------------------------
-
     async def refresh_all(self) -> None:
         await self.refresh_views()
         await self.refresh_final_video()
-
-    # ---- UI -----------------------------------------------------------
 
     def build(self) -> None:
         ui.page_title('Slide Narrator')
@@ -1856,9 +1867,20 @@ class SlideNarratorApp:
             self.lang_select = ui.radio({'ja': '🇯🇵 日本語', 'en': '🇺🇸 英語'}, value=self.lang_code).props('inline')
             self.lang_select.on_value_change(lambda e: self._lang_changed(e.value))
 
+            ui.label('既定の図表検出方式').classes('text-caption text-zinc-400 mt-2')
+            self.default_visual_mode_select = ui.radio(
+                {
+                    'auto': '🤖 自動（埋め込み基準）',
+                    'vlm': '👁 全スライドVLM探索',
+                    'pdf': '⚡ PDF構造のみ',
+                },
+                value=self.default_visual_mode,
+            ).props('dense')
+            self.default_visual_mode_select.on_value_change(lambda e: self._default_visual_mode_changed(e.value))
+
             self.pages_input = (
                 ui.input('ビデオ化対象', placeholder='例: 1-10,12', value=self.pages_spec)
-                .classes('w-full')
+                .classes('w-full mt-2')
                 .props('outlined dense')
                 .on_value_change(lambda e: self._range_changed())
             )
@@ -1926,6 +1948,10 @@ class SlideNarratorApp:
         asyncio.create_task(self.refresh_simple_editor())
         asyncio.create_task(self.refresh_editor())
 
+    def _default_visual_mode_changed(self, value: str) -> None:
+        self.default_visual_mode = value
+        self.save_project_settings()
+
     def _range_changed(self) -> None:
         new_val = self.pages_input.value or ''
         if new_val == self.pages_spec:
@@ -1976,5 +2002,4 @@ def login_page():
         ui.button('ログイン', on_click=try_login).props('color=primary').classes('w-full mt-2')
 
 
-# ui.run(title='Slide Narrator', reload=False, storage_secret='slide-narrator-session-secret-key-change-in-prod')
 ui.run(title='Slide Narrator', reload=False, show=False, port=17171, host='0.0.0.0', storage_secret='slide-narrator-session-secret-key-change-in-prod')

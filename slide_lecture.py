@@ -106,13 +106,13 @@ Summarize the core narrative: problem definition, key technical innovation, expe
 """
 
 ALIGN_SYSTEM_JA = """あなたはプレゼンテーション動画の視線誘導（レーザーポインタ位置）を設計するアシスタントです．
-スライド画像と，スライド上の要素一覧（通常テキスト，プログラムの各行「Line N: ...」，図・画像領域），および発表ナレーション文一覧が与えられます．
+スライド画像と，スライド上の要素一覧（通常テキスト，プログラムの各行「Line N: ...」，図・画像領域，画像内の各部品「[図内要素] ...」），および発表ナレーション文一覧が与えられます．
 
 スライド画像とテキスト内容を確認し，ナレーションの各文が「スライド内のどの要素・どの行を見せようとしているか」を判定してください．
 
 判定方針：
 1. プログラム・ソースコードへの言及：該当する code_line（Line N）の block_id をピンポイントで選んでください．
-2. 図・画像領域への言及：該当する図・画像領域の block_id を選んでください．
+2. 図・画像領域への言及：画像内の特定の部品（[図内要素]）に言及している場合はその subpart の block_id を優先し，図全体への言及であれば親の画像領域を選んでください．
 3. 通常テキスト・箇条書きへの言及：該当するテキストブロックの block_id を選んでください．
 4. 冒頭の挨拶やつなぎの言葉など，特定の要素を指すのが明らかに不自然な文のみ null にしてください．それ以外は文脈上もっとも近い block_id を割り当ててください．
 
@@ -124,13 +124,44 @@ ALIGN_SYSTEM_JA = """あなたはプレゼンテーション動画の視線誘�
 """
 
 ALIGN_SYSTEM_EN = """You are an assistant designing laser-pointer focus for a slide presentation video.
-Given slide elements and narration sentences, assign each sentence to the most relevant block_id (code_line, image, or text).
+Given slide elements and narration sentences, assign each sentence to the most relevant block_id (code_line, image, sub-elements in images, or text).
+If a sentence refers to a specific part inside an image, prioritize the subpart element over the whole image.
 Assign null only for broad opening or transitional phrases that have no visual anchor.
 
 Return ONLY a JSON array:
 [
   {"sentence_index": 0, "block_id": 1},
   {"sentence_index": 1, "block_id": 2}
+]
+"""
+
+DETECT_IMAGE_PARTS_SYSTEM_JA = """あなたはスライド内の図・グラフ・チャートを詳細に解析するアシスタントです．
+スライド画像内の図表・グラフ・イラストに含まれる主要な構成要素（図形部品，数式，テキスト説明文，凡例，データ系列，軸，ノードなど）を検出し，
+それぞれの種別（kind: "text" または "graphic"）と，0から1000に正規化された座標 [ymin, xmin, ymax, xmax] を抽出してください．
+※必ず縦方向(y)が先、横方向(x)が後です（0が上/左端、1000が下/右端）．
+
+種別の判定基準：
+- "text": 図中に埋め込まれた数式，文章，説明文，キーワード，ラベルなど（文字情報）
+- "graphic": 図形，ブロック，グラフの棒・折れ線，ノード枠，イラスト，アイコンなど（非テキストの視覚要素）
+
+必ず以下の形式のJSON配列のみを返してください：
+[
+  {"name": "提案モデルの構成ブロック", "kind": "graphic", "bbox": [150, 100, 350, 400]},
+  {"name": "損失関数の定義式", "kind": "text", "bbox": [420, 120, 480, 500]},
+  {"name": "青色の精度比較バー", "kind": "graphic", "bbox": [550, 600, 750, 680]}
+]
+"""
+
+DETECT_IMAGE_PARTS_SYSTEM_EN = """You are an assistant analyzing diagrams, charts, and figures inside presentation slides.
+Detect individual visual sub-components inside figures/charts (shapes, equations, text explanations, legends, bars/lines, nodes, etc.),
+classify their kind ("text" for equations/labels/sentences, "graphic" for shapes/bars/icons/diagrams),
+and output their bounding boxes in normalized coordinates (0 to 1000): [ymin, xmin, ymax, xmax].
+Note: y coordinates come first, x coordinates come second (0 is top/left, 1000 is bottom/right).
+
+Return ONLY a JSON array:
+[
+  {"name": "Loss formula", "kind": "text", "bbox": [420, 120, 480, 500]},
+  {"name": "Encoder module", "kind": "graphic", "bbox": [150, 100, 350, 400]}
 ]
 """
 
@@ -154,7 +185,6 @@ Return ONLY a JSON array of translated strings matching the order and length of 
 # =====================================================================
 
 def emit_progress(phase: str, current: int, total: int, page: int | None = None, message: str = "", reused: bool = False) -> None:
-    """GUIおよび外部プロセス向けの構造化進捗イベントを出力します．"""
     payload = {
         "phase": phase,
         "current": current,
@@ -167,7 +197,6 @@ def emit_progress(phase: str, current: int, total: int, page: int | None = None,
 
 
 def atomic_write_text(target: Path, text: str, encoding: str = "utf-8") -> None:
-    """一時ファイルを経由してアトミックにテキストを書き出します．"""
     target.parent.mkdir(parents=True, exist_ok=True)
     temp_target = target.with_name(f".{target.stem}.tmp{target.suffix}")
     try:
@@ -190,7 +219,6 @@ def check_ffmpeg() -> None:
 
 @lru_cache(maxsize=1)
 def detect_best_video_encoder() -> tuple[str, list[str]]:
-    """実行環境をチェックし、利用可能な最適な動画エンコーダとオプションを返します．"""
     try:
         res = subprocess.run(
             ["ffmpeg", "-encoders"],
@@ -439,6 +467,98 @@ def extract_page_blocks(pdf: Path, page_index: int, dpi: int) -> list[dict]:
                 existing_boxes.append(bbox)
 
     return targets
+
+
+def detect_visual_elements_with_vlm(
+    client: OpenAI,
+    cfg: dict,
+    image_path: Path,
+    lang: str = "ja",
+) -> list[dict]:
+    """Vision-LLMを用いて画像・図表の内部構成要素のバウンディングボックスを抽出します．"""
+    if not image_path.exists():
+        return []
+
+    try:
+        with Image.open(image_path) as img:
+            img_w, img_h = img.size
+    except Exception:
+        img_w, img_h = 1920, 1080
+
+    sys_prompt = DETECT_IMAGE_PARTS_SYSTEM_JA if lang == "ja" else DETECT_IMAGE_PARTS_SYSTEM_EN
+    user_instruction = (
+        "スライド画像内の図表・グラフに含まれる構成要素（部品・数式・テキスト・凡例・ノードなど）を検出し，"
+        "種別 kind ('text' または 'graphic') と 0〜1000に正規化した座標 [ymin, xmin, ymax, xmax] で出力してください．"
+        if lang == "ja"
+        else "Detect visual components (parts, formulas, text, legends, nodes), their kind ('text' or 'graphic'), and normalized coordinates (0-1000): [ymin, xmin, ymax, xmax]."
+    )
+
+    content = [
+        {"type": "text", "text": user_instruction},
+        {"type": "image_url", "image_url": {"url": image_data_url(image_path)}},
+    ]
+
+    try:
+        response = client.chat.completions.create(
+            model=cfg["model"],
+            temperature=0.0,
+            max_tokens=2000,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": content},
+            ],
+            extra_body={"reasoning_effort": "none"},
+        )
+
+        data = extract_json(response.choices[0].message.content)
+        sub_elements = []
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                raw_box = item.get("bbox")
+                name = item.get("name", "要素")
+                kind = item.get("kind", "graphic")
+                if isinstance(raw_box, list) and len(raw_box) == 4:
+                    is_normalized = max(raw_box) <= 1000
+
+                    if is_normalized:
+                        ymin_norm, xmin_norm, ymax_norm, xmax_norm = raw_box
+                        xmin = int((xmin_norm / 1000.0) * img_w)
+                        xmax = int((xmax_norm / 1000.0) * img_w)
+                        ymin = int((ymin_norm / 1000.0) * img_h)
+                        ymax = int((ymax_norm / 1000.0) * img_h)
+                    else:
+                        xmin, ymin, xmax, ymax = [int(v) for v in raw_box]
+
+                    xmin = max(0, min(img_w, xmin))
+                    ymin = max(0, min(img_h, ymin))
+                    xmax = max(0, min(img_w, xmax))
+                    ymax = max(0, min(img_h, ymax))
+
+                    if xmax <= xmin or ymax <= ymin:
+                        continue
+
+                    # テキスト／数式は左端（行頭）から16px内側，図形は矩形中央をポイント
+                    if kind == "text":
+                        px = min(xmax, xmin + 16)
+                    else:
+                        px = xmin + (xmax - xmin) // 2
+
+                    py = ymin + (ymax - ymin) // 2
+
+                    sub_elements.append({
+                        "type": "image_subpart",
+                        "kind": kind,
+                        "text": f"[図内要素:{'文' if kind == 'text' else '図'}] {name}",
+                        "x": px,
+                        "y": py,
+                        "bbox": [xmin, ymin, xmax, ymax],
+                    })
+        return sub_elements
+    except Exception as e:
+        print(f"[VLM WARN] 図表内要素の検出に失敗しました（スキップします）: {e}")
+        return []
 
 
 def split_sentences(text: str, lang: str = "ja") -> list[str]:
@@ -691,7 +811,7 @@ def align_narration_with_blocks(
             "type": b["type"],
             "bbox": b["bbox"],
         }
-        if b["type"] in ("text", "code_line"):
+        if b["type"] in ("text", "code_line", "image_subpart"):
             item["text"] = b["text"][:150]
         else:
             item["description"] = "スライド内の画像・図表領域" if lang == "ja" else "Slide image/figure region"
@@ -943,7 +1063,6 @@ def generate_single_explanation(
     mode: str = "lecture",
     lang: str = "ja",
 ) -> str:
-    """単一スライドのナレーション原稿を前後の文脈を考慮して生成・保存します．"""
     out_dir.mkdir(parents=True, exist_ok=True)
     page_texts = extract_page_text(pdf)
 
@@ -1003,8 +1122,25 @@ def generate_single_alignment(
     text: str,
     dpi: int,
     lang: str,
+    visual_mode: str = "auto",
 ) -> dict:
     blocks = extract_page_blocks(pdf, page_num - 1, dpi)
+    image_blocks = [b for b in blocks if b["type"] == "image"]
+
+    should_run_vlm = False
+    if visual_mode == "vlm":
+        should_run_vlm = True
+    elif visual_mode == "auto":
+        should_run_vlm = bool(image_blocks)
+    elif visual_mode == "pdf":
+        should_run_vlm = False
+
+    if should_run_vlm:
+        sub_elements = detect_visual_elements_with_vlm(client, cfg, image_path, lang=lang)
+        for elem in sub_elements:
+            elem["block_id"] = len(blocks)
+            blocks.append(elem)
+
     sentences = split_sentences(text, lang=lang)
     alignments = align_narration_with_blocks(client, cfg, image_path, blocks, sentences, lang=lang)
 
@@ -1022,6 +1158,7 @@ def generate_single_alignment(
 
     return {
         "page": page_num,
+        "visual_mode": visual_mode,
         "blocks": blocks,
         "alignments": alignments,
     }
@@ -1035,7 +1172,6 @@ def generate_single_tts(
     force: bool,
     lang: str = "ja",
 ) -> None:
-    """単一スライドの音声をTTSエンジンで合成・保存します．"""
     generate_tts(
         text_path=text_path,
         out_path=out_path,
@@ -1055,7 +1191,6 @@ def generate_single_page_video(
     video_cfg: dict,
     force: bool,
 ) -> None:
-    """単一スライドの動画をレンダリングします．"""
     generate_page_video(
         image=image,
         audio=audio,
@@ -1146,12 +1281,15 @@ def generate_alignments(
     force: bool,
     lang: str = "ja",
     active_pages: set[int] | None = None,
+    default_visual_mode: str = "auto",
+    page_visual_modes: dict[str, str] | None = None,
 ) -> None:
     client = make_client(cfg)
     active_indices = [
         idx for idx in range(len(images))
         if active_pages is None or (idx + 1) in active_pages
     ]
+    page_visual_modes = page_visual_modes or {}
 
     for k, i_idx in enumerate(active_indices, 1):
         i = i_idx + 1
@@ -1167,10 +1305,11 @@ def generate_alignments(
             print(f"[ALIGN] reuse {align_out}")
             continue
 
-        emit_progress("align", k, len(active_indices), page=i, message=f"スライド {i}（{k}/{len(active_indices)}）")
-        print(f"[ALIGN] 字幕＆ポインタ解析: page {i}/{len(images)}")
+        vmode = page_visual_modes.get(str(i), default_visual_mode)
+        emit_progress("align", k, len(active_indices), page=i, message=f"スライド {i}（{k}/{len(active_indices)}, 方式:{vmode}）")
+        print(f"[ALIGN] 字幕＆ポインタ解析: page {i}/{len(images)} (visual_mode={vmode})")
         raw_text = text_file.read_text(encoding="utf-8").strip()
-        align_data = generate_single_alignment(client, cfg, pdf, i, image, raw_text, dpi, lang)
+        align_data = generate_single_alignment(client, cfg, pdf, i, image, raw_text, dpi, lang, visual_mode=vmode)
         atomic_write_text(align_out, json.dumps(align_data, ensure_ascii=False, indent=2))
 
 
@@ -1413,7 +1552,6 @@ STAGES = ("pdf", "explain", "align", "tts", "video")
 
 
 def _force_cleanup(root: Path, pdf: Path, start: str) -> None:
-    """開始ステージに応じて，そのステージ以降の生成物を初期化します．"""
     print(f"[FORCE CLEANUP] 開始ステージ '{start}' に応じて下流ファイルを削除・初期化します．")
 
     for path in root.glob(f"{pdf.stem}*"):
@@ -1441,7 +1579,6 @@ def _force_cleanup(root: Path, pdf: Path, start: str) -> None:
 
 
 def _resolve_active_pages(total_pages: int, pages_spec: str, skip_pages_spec: str) -> list[int]:
-    """対象スライドを昇順で返します．"""
     active_pages = set(range(1, total_pages + 1))
 
     if pages_spec:
@@ -1532,7 +1669,6 @@ def _run_video_stage(
             blocks = align_data.get("blocks", [])
             alignments = align_data.get("alignments", [])
 
-            # build_pointer_schedule は tts_sentence があればそれを時間配分に使用する．
             for item in alignments:
                 item["tts_sentence"] = item["sentence"]
 
@@ -1584,7 +1720,6 @@ def _run_video_stage(
     )
 
 
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="PDFから講義・研究発表動画を自動生成します．"
@@ -1603,6 +1738,12 @@ def main() -> int:
     parser.add_argument("--lang", choices=["ja", "en"], default=None, help="主言語")
     parser.add_argument("--pages", type=str, default=None, help="対象スライド番号または範囲（例: '1-10,12'）")
     parser.add_argument("--skip-pages", type=str, default=None, help="除外スライド番号または範囲（例: '5,11-13'）")
+    parser.add_argument(
+        "--visual-mode",
+        choices=["auto", "vlm", "pdf"],
+        default=None,
+        help="図表要素の検出方式 (auto: 埋め込み画像のみ対象, vlm: 常に画像全体から検出, pdf: VLM検出を無効化)",
+    )
     args = parser.parse_args()
 
     if not args.pdf.exists():
@@ -1623,12 +1764,20 @@ def main() -> int:
         if args.skip_pages is not None
         else proj_cfg.get("skip_pages", "")
     )
+    visual_mode = (
+        args.visual_mode
+        or proj_cfg.get("visual_mode")
+        or cfg.get("visual_mode", "auto")
+    )
+    page_visual_modes = proj_cfg.get("slide_visual_modes", {})
 
     proj_cfg.update({
         "mode": mode,
         "language": lang,
         "pages": pages_spec,
         "skip_pages": skip_pages_spec,
+        "visual_mode": visual_mode,
+        "slide_visual_modes": page_visual_modes,
     })
     save_project_json(root, proj_cfg)
 
@@ -1695,6 +1844,8 @@ def main() -> int:
         args.force,
         lang=lang,
         active_pages=active_pages,
+        default_visual_mode=visual_mode,
+        page_visual_modes=page_visual_modes,
     )
 
     if args.start == "align":
