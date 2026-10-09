@@ -1667,6 +1667,13 @@ def concat_videos(
     if track_map:
         cmd.extend(["-c:s", "mov_text"])
 
+    # メタデータ埋め込み
+    cmd.extend([
+        "-metadata", "encoder=Slide Narrator | TAKAGO LAB",
+        "-metadata", "comment=Slide Narrator | TAKAGO LAB",
+        "-metadata", "artist=TAKAGO LAB",
+    ])
+
     cmd.extend([
         "-movflags", "+faststart",
         "-f", "mp4",
