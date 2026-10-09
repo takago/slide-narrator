@@ -789,25 +789,48 @@ class SlideNarratorApp:
             ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
             return
 
-        # --- 追加: ナレーション原稿の存在・空チェック ---
-        if stage in ('align', 'tts', 'video') and self.paths:
-            empty_pages = []
-            for p in self.active_pages:
-                txt_p = self.paths.explanation(p)
-                if not txt_p.exists() or not txt_p.read_text(encoding='utf-8').strip():
-                    empty_pages.append(p)
+        # --- 実行すべき一連のステージを算出 ---
+        # 依存関係:
+        #   explain: 前提なし
+        #   align  : 要 explain
+        #   tts    : 要 explain
+        #   video  : 要 explain -> align -> tts
+        stages_to_run: list[str] = []
 
-            if empty_pages:
-                pages_str = ", ".join(f"スライド {p}" for p in empty_pages)
-                ui.notify(
-                    f'{pages_str} のナレーション原稿が空です．確認・生成してください．',
-                    type='warning',
-                    duration=6.0,
-                )
-                return
-        # --------------------------------------------------
+        has_missing_explain = any(
+            not self.paths.explanation(p).exists()
+            or not self.paths.explanation(p).read_text(encoding='utf-8').strip()
+            for p in self.active_pages
+        )
+        has_missing_align = any(
+            not self.paths.alignment(p).exists()
+            for p in self.active_pages
+        )
+        has_missing_tts = any(
+            not self.paths.audio(p).exists()
+            for p in self.active_pages
+        )
 
-        # 排他制御チェック（キューイングなし）
+        if stage == 'explain':
+            stages_to_run = ['explain']
+        elif stage == 'align':
+            if has_missing_explain:
+                stages_to_run.append('explain')
+            stages_to_run.append('align')
+        elif stage == 'tts':
+            if has_missing_explain:
+                stages_to_run.append('explain')
+            stages_to_run.append('tts')
+        elif stage == 'video':
+            if has_missing_explain:
+                stages_to_run.append('explain')
+            if has_missing_align:
+                stages_to_run.append('align')
+            if has_missing_tts:
+                stages_to_run.append('tts')
+            stages_to_run.append('video')
+
+        # 排他制御チェック
         lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"パイプライン ({stage})")
         if not lock_acquired:
             msg = f'他のユーザー（{GLOBAL_EXECUTION_LOCK.current_user or "誰か"}）が「{GLOBAL_EXECUTION_LOCK.task_name or "処理"}」を実行中です．完了するまでリクエストは受け付けられません．'
@@ -818,86 +841,93 @@ class SlideNarratorApp:
         dialog, update_status, push_log = self.open_processing_dialog(initial_title)
         self.set_processing(True)
 
-        total_active_slides = len(self.active_pages)
-        cmd = [sys.executable, '-u', 'slide_lecture.py', str(self.pdf), '--from', stage, *self.base_args()]
-
-        env = os.environ.copy()
-        env['PYTHONUNBUFFERED'] = '1'
-
         phase_titles = {
             'explain': '① ナレーション原稿を作成中…',
             'align': '② 字幕・ポインタを解析中…',
-            'tts': f'③ 音声を合成中…',
+            'tts': '③ 音声を合成中…',
             'video': '④ スライド動画をレンダリング中…',
             'concat': '④ 完成動画を結合・生成中…',
         }
 
+        total_active_slides = len(self.active_pages)
+        env = os.environ.copy()
+        env['PYTHONUNBUFFERED'] = '1'
+
         try:
-            update_status('処理を開始しています…', 0.0, current_page=self.active_pages[0])
-            await asyncio.sleep(0.05)
-
-            create_group_kwargs = {}
-            if sys.platform != "win32":
-                create_group_kwargs['preexec_fn'] = os.setsid
-
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env=env,
-                **create_group_kwargs,
-            )
-            self.current_process = proc
-
-            full_logs: list[str] = []
-
-            while True:
-                line_bytes = await proc.stdout.readline()
-                if not line_bytes:
+            for current_stage in stages_to_run:
+                if self.cancellation_requested:
                     break
-                line = line_bytes.decode('utf-8', errors='replace').rstrip()
-                full_logs.append(line)
-                push_log(line)
-                if self.history_log_widget:
-                    self.history_log_widget.push(line)
 
-                if line.startswith('[PROGRESS]'):
-                    try:
-                        p_data = json.loads(line[10:].strip())
-                        phase = p_data.get('phase')
-                        cur = p_data.get('current', 1)
-                        tot = p_data.get('total', total_active_slides)
-                        p_num = p_data.get('page')
-                        msg = p_data.get('message', '')
+                stage_title = phase_titles.get(current_stage, f'{current_stage} を実行中…')
+                update_status(f'{stage_title} を開始します…', 0.0, title=stage_title, current_page=self.active_pages[0])
+                push_log(f'=== ステージ開始: {current_stage} ===')
+                await asyncio.sleep(0.05)
 
-                        title = phase_titles.get(phase, initial_title)
-                        weight = 0.9 if phase == 'video' else 1.0
-                        frac = (cur / max(1, tot)) * weight if tot else 0.5
-                        if phase == 'concat':
-                            frac = 0.95
-                            status_label_text = msg or '完成動画を結合・生成中…'
-                        elif p_num is not None:
-                            status_label_text = f'スライド {p_num}（{cur}/{tot}）'
-                        else:
-                            status_label_text = msg or f'スライド {cur}（{cur}/{tot}）'
+                cmd = [sys.executable, '-u', 'slide_lecture.py', str(self.pdf), '--from', current_stage, *self.base_args()]
 
-                        update_status(status_label_text, frac, title=title, current_page=p_num)
-                    except Exception:
-                        pass
+                create_group_kwargs = {}
+                if sys.platform != "win32":
+                    create_group_kwargs['preexec_fn'] = os.setsid
 
-                await asyncio.sleep(0.01)
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                    env=env,
+                    **create_group_kwargs,
+                )
+                self.current_process = proc
 
-            rc = await proc.wait()
-            self.log = '\n'.join(full_logs)
+                full_logs: list[str] = []
+                while True:
+                    line_bytes = await proc.stdout.readline()
+                    if not line_bytes:
+                        break
+                    line = line_bytes.decode('utf-8', errors='replace').rstrip()
+                    full_logs.append(line)
+                    push_log(line)
+                    if self.history_log_widget:
+                        self.history_log_widget.push(line)
+
+                    if line.startswith('[PROGRESS]'):
+                        try:
+                            p_data = json.loads(line[10:].strip())
+                            phase = p_data.get('phase')
+                            cur = p_data.get('current', 1)
+                            tot = p_data.get('total', total_active_slides)
+                            p_num = p_data.get('page')
+                            msg = p_data.get('message', '')
+
+                            title = phase_titles.get(phase, stage_title)
+                            weight = 0.9 if phase == 'video' else 1.0
+                            frac = (cur / max(1, tot)) * weight if tot else 0.5
+                            if phase == 'concat':
+                                frac = 0.95
+                                status_label_text = msg or '完成動画を結合・生成中…'
+                            elif p_num is not None:
+                                status_label_text = f'スライド {p_num}（{cur}/{tot}）'
+                            else:
+                                status_label_text = msg or f'スライド {cur}（{cur}/{tot}）'
+
+                            update_status(status_label_text, frac, title=title, current_page=p_num)
+                        except Exception:
+                            pass
+
+                    await asyncio.sleep(0.01)
+
+                rc = await proc.wait()
+                self.log = '\n'.join(full_logs)
+
+                if rc != 0:
+                    ui.notify(f'ステージ {current_stage} が終了コード {rc} で失敗したため処理を中断しました．', type='negative')
+                    break
 
             if self.cancellation_requested:
                 ui.notify('処理を中断しました．完了したスライドは保存されています．', type='warning')
             elif rc == 0:
-                update_status('完了しました！', 1.0, title='処理が完了しました')
+                update_status('全工程が完了しました！', 1.0, title='処理が完了しました')
                 await asyncio.sleep(0.5)
-                ui.notify('パイプライン処理が完了しました．', type='positive')
-            else:
-                ui.notify(f'処理が終了コード {rc} で終了しました．ログタブを確認してください．', type='negative')
+                ui.notify('要求された処理がすべて完了しました．', type='positive')
 
             await self.refresh_all()
 
