@@ -1666,12 +1666,13 @@ def concat_videos(
     cmd.extend(["-c:v", "copy", "-c:a", "copy"])
     if track_map:
         cmd.extend(["-c:s", "mov_text"])
-
-    # メタデータ埋め込み
+    
+    credit_text = "Slide Narrator | TAKAGO LAB"
+    repo_url = "https://github.com/takago/slide-narrator"
+    comment_text = f"{credit_text}\n{repo_url}"
     cmd.extend([
-        "-metadata", "encoder=Slide Narrator | TAKAGO LAB",
-        "-metadata", "comment=Slide Narrator | TAKAGO LAB",
-        "-metadata", "artist=TAKAGO LAB",
+        "-metadata", f"comment={comment_text}",
+        "-metadata", f"description={comment_text}",
     ])
 
     cmd.extend([
