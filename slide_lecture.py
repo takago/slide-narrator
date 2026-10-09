@@ -1489,6 +1489,11 @@ def generate_page_video(
         print(f"[VIDEO] reuse {out}")
         return
 
+    # 【修正箇所】出力先フォルダ（.../video/）を確実に作成する
+    out.parent.mkdir(parents=True, exist_ok=True)
+    temp_out = out.with_name(f".{out.stem}.tmp.mp4")
+    filter_script = out.parent / f".{out.stem}_filter.txt"
+
     out.parent.mkdir(parents=True, exist_ok=True)
     temp_out = out.with_name(f".{out.stem}.tmp.mp4")
     filter_script = out.parent / f".{out.stem}_filter.txt"
