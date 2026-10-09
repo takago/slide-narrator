@@ -789,6 +789,24 @@ class SlideNarratorApp:
             ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
             return
 
+        # --- 追加: ナレーション原稿の存在・空チェック ---
+        if stage in ('align', 'tts', 'video') and self.paths:
+            empty_pages = []
+            for p in self.active_pages:
+                txt_p = self.paths.explanation(p)
+                if not txt_p.exists() or not txt_p.read_text(encoding='utf-8').strip():
+                    empty_pages.append(p)
+
+            if empty_pages:
+                pages_str = ", ".join(f"スライド {p}" for p in empty_pages)
+                ui.notify(
+                    f'{pages_str} のナレーション原稿が空です．確認・生成してください．',
+                    type='warning',
+                    duration=6.0,
+                )
+                return
+        # --------------------------------------------------
+
         # 排他制御チェック（キューイングなし）
         lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"パイプライン ({stage})")
         if not lock_acquired:
