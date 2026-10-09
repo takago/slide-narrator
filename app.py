@@ -19,14 +19,17 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
+import hashlib
 import json
 import os
+from pathlib import Path
+import secrets
 import shutil
 import signal
 import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import Any, Callable
 
 import httpx
@@ -57,14 +60,158 @@ from tts_filter import (
 
 
 # ----------------------------------------------------------------------
-# Authentication Configuration
+# Concurrency / Global Execution Lock (排他制御)
 # ----------------------------------------------------------------------
 
-# ユーザー名とパスワード（運用環境に合わせて変更してください）
-USERS = {
-    'admin': 'secret',
-    'guest': 'guest',
+class ExecutionLockManager:
+    """複数のユーザーやセッションが同時に重い推論・レンダリング処理を行わないよう排他制御するマネージャ"""
+    def __init__(self) -> None:
+        self.lock = asyncio.Lock()
+        self.current_user: str | None = None
+        self.task_name: str | None = None
+
+    def is_locked(self) -> bool:
+        return self.lock.locked()
+
+    async def acquire(self, username: str, task_name: str) -> bool:
+        """ロックを即座に試行取得。他が実行中の場合はキューイングせず即座に False を返す"""
+        if self.lock.locked():
+            return False
+        await self.lock.acquire()
+        self.current_user = username
+        self.task_name = task_name
+        return True
+
+    def release(self) -> None:
+        if self.lock.locked():
+            self.lock.release()
+        self.current_user = None
+        self.task_name = None
+
+
+GLOBAL_EXECUTION_LOCK = ExecutionLockManager()
+
+
+# ----------------------------------------------------------------------
+# Password Hashing & Verification (PBKDF2-HMAC-SHA256)
+# ----------------------------------------------------------------------
+
+def hash_password(password: str) -> str:
+    """PBKDF2-HMAC-SHA256 によるソルト付きストレッチングハッシュ生成"""
+    salt = secrets.token_hex(16)
+    key = hashlib.pbkdf2_hmac(
+        'sha256',
+        password.encode('utf-8'),
+        salt.encode('utf-8'),
+        iterations=100_000,
+    )
+    return f"pbkdf2:sha256:100000${salt}${key.hex()}"
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    """平文パスワードと保存されたハッシュ値の照合（平文との互換移行対応）"""
+    if not stored_hash:
+        return False
+
+    # 平文からハッシュ化への過渡期互換（平文で完全一致すればOK）
+    if not stored_hash.startswith('pbkdf2:sha256:'):
+        return password == stored_hash
+
+    try:
+        header, salt, key_hex = stored_hash.split('$')
+        _, _, iter_str = header.split(':')
+        iterations = int(iter_str)
+        calc_key = hashlib.pbkdf2_hmac(
+            'sha256',
+            password.encode('utf-8'),
+            salt.encode('utf-8'),
+            iterations=iterations,
+        )
+        return secrets.compare_digest(calc_key.hex(), key_hex)
+    except Exception:
+        return False
+
+
+# ----------------------------------------------------------------------
+# User Management & Persistence (users.yaml)
+# ----------------------------------------------------------------------
+
+USERS_FILE = Path('users.yaml')
+
+DEFAULT_USERS_DATA = {
+    'users': {
+        'admin': {
+            'password': hash_password('secret'),
+            'is_admin': True,
+            'valid_from': '',
+            'valid_until': '',
+        },
+        'guest': {
+            'password': hash_password('guest'),
+            'is_admin': False,
+            'valid_from': '',
+            'valid_until': '',
+        },
+    }
 }
+
+
+def load_users() -> dict[str, Any]:
+    if not USERS_FILE.exists():
+        save_users(DEFAULT_USERS_DATA)
+        return DEFAULT_USERS_DATA
+    try:
+        data = yaml.safe_load(USERS_FILE.read_text(encoding='utf-8'))
+        if not data or 'users' not in data:
+            return DEFAULT_USERS_DATA
+        return data
+    except Exception:
+        return DEFAULT_USERS_DATA
+
+
+def save_users(data: dict[str, Any]) -> None:
+    USERS_FILE.write_text(
+        yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+        encoding='utf-8',
+    )
+
+
+def is_user_within_allowed_period(user_info: dict[str, Any]) -> tuple[bool, str]:
+    """利用可能日時制限の判定 (YYYY-MM-DD HH:MM または YYYY-MM-DD 形式)"""
+    # 管理者権限を持つユーザーは事故防止のため常に利用可能とする
+    if user_info.get('is_admin', False):
+        return True, ''
+
+    v_from = str(user_info.get('valid_from') or '').strip()
+    v_until = str(user_info.get('valid_until') or '').strip()
+
+    if not v_from and not v_until:
+        return True, ''
+
+    now = datetime.now()
+
+    def parse_dt(s: str, is_end: bool = False) -> datetime | None:
+        for fmt in ('%Y-%m-%d %H:%M', '%Y-%m-%d %H:%M:%S', '%Y-%m-%d'):
+            try:
+                dt = datetime.strptime(s, fmt)
+                if fmt == '%Y-%m-%d' and is_end:
+                    dt = dt.replace(hour=23, minute=59, second=59)
+                return dt
+            except ValueError:
+                pass
+        return None
+
+    if v_from:
+        dt_from = parse_dt(v_from, is_end=False)
+        if dt_from and now < dt_from:
+            return False, f'このアカウントは利用開始日時（{v_from}）前です．'
+
+    if v_until:
+        dt_until = parse_dt(v_until, is_end=True)
+        if dt_until and now > dt_until:
+            return False, f'このアカウントは利用可能期限（{v_until}）を過ぎています．'
+
+    return True, ''
 
 
 # ----------------------------------------------------------------------
@@ -73,15 +220,21 @@ USERS = {
 
 CONFIG_PATH = Path('config.yaml')
 TTS_FILTER_PATH = Path('tts_filter.yaml')
-UPLOAD_DIR = Path('webui_uploads')
-UPLOAD_DIR.mkdir(exist_ok=True)
-TEST_AUDIO_DIR = UPLOAD_DIR / 'test_audio'
-TEST_AUDIO_DIR.mkdir(exist_ok=True)
-TEST_VLM_DIR = UPLOAD_DIR / 'test_vlm'
-TEST_VLM_DIR.mkdir(exist_ok=True)
+BASE_UPLOAD_DIR = Path('webui_uploads')
+BASE_UPLOAD_DIR.mkdir(exist_ok=True)
+
+
+def get_user_workspace(username: str) -> Path:
+    """ユーザーごとの個別作業ディレクトリ"""
+    safe_name = "".join(c for c in username if c.isalnum() or c in ('_', '-')).strip() or 'unknown'
+    p = BASE_UPLOAD_DIR / safe_name
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 def load_config(path: Path) -> dict:
+    if not path.exists():
+        return {}
     return yaml.safe_load(path.read_text(encoding='utf-8')) or {}
 
 
@@ -277,8 +430,17 @@ async def download_file(path: str):
 # ----------------------------------------------------------------------
 
 class SlideNarratorApp:
-    def __init__(self) -> None:
+    def __init__(self, username: str) -> None:
+        self.username = username
         self.cfg = load_config(CONFIG_PATH)
+
+        # ユーザー固有の作業ディレクトリ
+        self.user_dir = get_user_workspace(self.username)
+        self.test_audio_dir = self.user_dir / 'test_audio'
+        self.test_audio_dir.mkdir(exist_ok=True)
+        self.test_vlm_dir = self.user_dir / 'test_vlm'
+        self.test_vlm_dir.mkdir(exist_ok=True)
+
         self.pdf: Path | None = None
         self.paths: ProjectPaths | None = None
         self.images: list[Path] = []
@@ -308,6 +470,7 @@ class SlideNarratorApp:
         self.slide_video_gallery = None
         self.final_video_container = None
         self.settings_container = None
+        self.user_manage_container = None
         self.mode_select = None
         self.lang_select = None
         self.default_vlm_switch = None
@@ -380,10 +543,10 @@ class SlideNarratorApp:
 
     async def load_pdf(self, e) -> None:
         filename = Path(e.file.name).name
-        target_pdf = UPLOAD_DIR / filename
+        target_pdf = self.user_dir / filename
         target_paths = ProjectPaths(target_pdf)
 
-        temp_pdf = UPLOAD_DIR / f".upload_{int(time.time())}_{filename}"
+        temp_pdf = self.user_dir / f".upload_{int(time.time())}_{filename}"
         await e.file.save(temp_pdf)
 
         has_existing_project = target_paths.root.exists() or target_pdf.exists()
@@ -626,6 +789,13 @@ class SlideNarratorApp:
             ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
             return
 
+        # 排他制御チェック（キューイングなし）
+        lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"パイプライン ({stage})")
+        if not lock_acquired:
+            msg = f'他のユーザー（{GLOBAL_EXECUTION_LOCK.current_user or "誰か"}）が「{GLOBAL_EXECUTION_LOCK.task_name or "処理"}」を実行中です．完了するまでリクエストは受け付けられません．'
+            ui.notify(msg, type='negative', duration=5)
+            return
+
         self.save_project_settings()
         dialog, update_status, push_log = self.open_processing_dialog(initial_title)
         self.set_processing(True)
@@ -723,6 +893,7 @@ class SlideNarratorApp:
         finally:
             self.current_process = None
             self.set_processing(False)
+            GLOBAL_EXECUTION_LOCK.release()
             dialog.close()
 
     def alignment_data(self, page: int) -> tuple[dict, list[dict], list[dict]]:
@@ -756,6 +927,13 @@ class SlideNarratorApp:
         if self.processing:
             ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
             return
+
+        lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"スライド {page} ナレーション再生成")
+        if not lock_acquired:
+            msg = f'他のユーザー（{GLOBAL_EXECUTION_LOCK.current_user or "誰か"}）が「{GLOBAL_EXECUTION_LOCK.task_name or "処理"}」を実行中です．完了するまでリクエストは受け付けられません．'
+            ui.notify(msg, type='negative', duration=5)
+            return
+
         dialog, update_status, push_log = self.open_processing_dialog(f'スライド {page} のナレーションをLLMで再作成中…')
         self.set_processing(True)
         self.current_task = asyncio.current_task()
@@ -800,6 +978,7 @@ class SlideNarratorApp:
         finally:
             self.current_task = None
             self.set_processing(False)
+            GLOBAL_EXECUTION_LOCK.release()
             dialog.close()
 
     async def save_and_realign(self, page: int, text: str, page_use_vlm: bool | None = None) -> None:
@@ -823,6 +1002,13 @@ class SlideNarratorApp:
         if self.processing:
             ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
             return
+
+        lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"スライド {page} 字幕・ポインタ再解析")
+        if not lock_acquired:
+            msg = f'他のユーザー（{GLOBAL_EXECUTION_LOCK.current_user or "誰か"}）が「{GLOBAL_EXECUTION_LOCK.task_name or "処理"}」を実行中です．完了するまでリクエストは受け付けられません．'
+            ui.notify(msg, type='negative', duration=5)
+            return
+
         mode_label = "VLM併用" if mode_str == 'vlm' else "PDF基準"
         dialog, update_status, push_log = self.open_processing_dialog(f'スライド {page} の要素抽出と視線誘導を再解析中…')
         self.set_processing(True)
@@ -861,6 +1047,7 @@ class SlideNarratorApp:
         finally:
             self.current_task = None
             self.set_processing(False)
+            GLOBAL_EXECUTION_LOCK.release()
             dialog.close()
 
     async def save_alignment(self, page: int, rows: list[dict], align_data: dict) -> None:
@@ -887,6 +1074,12 @@ class SlideNarratorApp:
             return
         if self.processing:
             ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
+            return
+
+        lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"スライド {page} 音声合成")
+        if not lock_acquired:
+            msg = f'他のユーザー（{GLOBAL_EXECUTION_LOCK.current_user or "誰か"}）が「{GLOBAL_EXECUTION_LOCK.task_name or "処理"}」を実行中です．完了するまでリクエストは受け付けられません．'
+            ui.notify(msg, type='negative', duration=5)
             return
 
         dialog, update_status, push_log = self.open_processing_dialog(f'スライド {page} の音声を合成中 ({self.lang_code})…')
@@ -929,6 +1122,7 @@ class SlideNarratorApp:
         finally:
             self.current_task = None
             self.set_processing(False)
+            GLOBAL_EXECUTION_LOCK.release()
             dialog.close()
 
     async def refresh_gallery(self) -> None:
@@ -1054,7 +1248,6 @@ class SlideNarratorApp:
                     ).props('dense color=primary')
                     page_vlm_switch.tooltip('ONにすると図やグラフ・数式の内部要素まで細かくポインティングします．OFFにするとPDFテキストのみを使用します．')
 
-            # VLMテストと同じ配置：スライド画像を左，検出要素一覧を右に固定して横並びにする．
             with ui.row().classes('w-full items-start gap-6 flex-nowrap'):
                 with ui.column().classes('flex-[2] min-w-0 gap-3'):
                     if img.exists():
@@ -1172,52 +1365,6 @@ class SlideNarratorApp:
                         await self.save_alignment(page, out, align_data)
 
                     ui.button('💾 字幕・ポインタ修正を保存', on_click=save_rows).classes('w-full mt-2')
-                    text_area = ui.textarea(
-                        f'主言語ナレーション原稿（{main_lang}）',
-                        value=current_text,
-                    ).props('outlined').classes('w-full').style('min-height: 180px')
-                    with ui.row().classes('w-full gap-2'):
-                        ui.button('✨ ナレーションを再生成',
-                                  on_click=lambda: self.regenerate_narration(page, text_area)).classes('grow').props('outline')
-                        ui.button('🔄 保存して字幕・ポインタを再解析',
-                                  on_click=lambda: self.save_and_realign(page, text_area.value, page_vlm_switch.value)).classes('grow').props('color=primary')
-
-                    if alignments:
-                        ui.separator()
-                        ui.label('🎯 文ごとのポインタ先 & 対訳字幕の微調整').classes('text-h6')
-                        block_options = [None] + [b['block_id'] for b in blocks]
-                        rows = []
-                        for item in alignments:
-                            rows.append({
-                                'sentence': item.get('sentence', ''),
-                                'block_id': item.get('block_id'),
-                                'translation': item.get('en_sentence', '') if self.lang_code == 'ja' else item.get('ja_sentence', ''),
-                            })
-
-                        for i, row in enumerate(rows, 1):
-                            with ui.card().classes('w-full p-4 bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 rounded-lg gap-2 shadow-xs'):
-                                with ui.row().classes('w-full items-start gap-2'):
-                                    ui.label(f'文 {i}').classes('text-xs font-bold text-white bg-blue-600 dark:bg-blue-500 px-2 py-0.5 rounded shrink-0 mt-0.5')
-                                    ui.label(row['sentence']).classes('text-sm font-medium text-gray-900 dark:text-gray-100 grow leading-relaxed')
-
-                                with ui.row().classes('w-full items-center gap-3 pt-1'):
-                                    select = ui.select(block_options, value=row['block_id'], label='ポインタ先').props('dense outlined').classes('w-44 shrink-0')
-                                    trans = ui.input('対訳字幕', value=row['translation']).props('dense outlined').classes('grow')
-                                    row['_select'] = select
-                                    row['_trans'] = trans
-
-                        async def save_rows() -> None:
-                            out = []
-                            for row in rows:
-                                bid = row['_select'].value
-                                tr = row['_trans'].value or ''
-                                if self.lang_code == 'ja':
-                                    out.append({'sentence': row['sentence'], 'block_id': bid, 'ja_sentence': row['sentence'], 'en_sentence': tr})
-                                else:
-                                    out.append({'sentence': row['sentence'], 'block_id': bid, 'en_sentence': row['sentence'], 'ja_sentence': tr})
-                            await self.save_alignment(page, out, align_data)
-
-                        ui.button('💾 字幕・ポインタ修正を保存', on_click=save_rows).classes('w-full mt-2')
 
     async def refresh_slide_videos(self) -> None:
         if not self.slide_video_gallery:
@@ -1369,7 +1516,7 @@ class SlideNarratorApp:
 
                 llm_test_btn.on_click(run_llm_test)
 
-            # --- VLM マルチモーダル接続テスト（任意の画像対応 & アスペクト比補正 & 番号凡例付き） ---
+            # --- VLM マルチモーダル接続テスト ---
             with ui.card().classes('w-full p-3 bg-zinc-950 border border-zinc-800 rounded-lg gap-3 mt-2'):
                 with ui.row().classes('items-center justify-between w-full'):
                     ui.label('👁️ VLM 画像認識 & アライメントテスト').classes('text-xs font-bold text-zinc-300')
@@ -1390,7 +1537,7 @@ class SlideNarratorApp:
 
                         async def handle_vlm_upload(e):
                             ext = Path(e.file.name).suffix or '.png'
-                            saved_path = TEST_VLM_DIR / f'vlm_test_input{ext}'
+                            saved_path = self.test_vlm_dir / f'vlm_test_input{ext}'
                             await e.file.save(saved_path)
                             uploaded_vlm_img['path'] = saved_path
                             vlm_run_btn.enable()
@@ -1406,7 +1553,6 @@ class SlideNarratorApp:
                         vlm_status_label = ui.label('画像をアップロードしてテストを開始してください．').classes('text-xs text-zinc-400')
                         vlm_description_box = ui.label('').classes('text-xs text-zinc-300 font-sans p-3 bg-zinc-900 border border-zinc-800 rounded min-h-[48px] w-full whitespace-pre-wrap leading-relaxed')
 
-                # 解析結果（プレビュー画像 ＆ ブロック凡例 ＆ JSON）表示領域
                 vlm_preview_container = ui.column().classes('w-full')
                 vlm_blocks_container = ui.column().classes('w-full')
 
@@ -1461,7 +1607,7 @@ class SlideNarratorApp:
                         vlm_description_box.text = summary_text.strip()
                         vlm_status_label.text = f'解析完了: {len(parsed_blocks)} 個の要素を検出しました．'
 
-                        preview_path = TEST_VLM_DIR / 'vlm_preview_result.png'
+                        preview_path = self.test_vlm_dir / 'vlm_preview_result.png'
                         if parsed_blocks:
                             preview_im = draw_block_preview(img_p, parsed_blocks)
                             preview_im.save(preview_path)
@@ -1696,7 +1842,7 @@ class SlideNarratorApp:
                             'voice': v,
                             'response_format': 'mp3',
                         }
-                        out_path = TEST_AUDIO_DIR / 'test_ja.mp3'
+                        out_path = self.test_audio_dir / 'test_ja.mp3'
 
                         def call_tts():
                             cl = make_client(tts_cfg)
@@ -1777,7 +1923,7 @@ class SlideNarratorApp:
                     en_model_select.update()
                     ui.notify(f'{len(model_ids)} 個のモデルを取得しました．', type='positive')
                 except Exception as err:
-                    ui.notify(f'モデル一覧取得に失敗しました（/v1/models 未対応の可能性）: {err}', type='negative')
+                    ui.notify(f'モデル一覧取得に失敗しました: {err}', type='negative')
                 finally:
                     en_model_fetch_btn.enable()
 
@@ -1840,7 +1986,7 @@ class SlideNarratorApp:
                             'voice': v,
                             'response_format': 'mp3',
                         }
-                        out_path = TEST_AUDIO_DIR / 'test_en.mp3'
+                        out_path = self.test_audio_dir / 'test_en.mp3'
 
                         def call_tts():
                             cl = make_client(tts_cfg)
@@ -2071,6 +2217,230 @@ class SlideNarratorApp:
 
             self._build_dict_editor()
 
+    def refresh_user_management(self) -> None:
+        """(2) 管理者用ユーザー管理タブの構築（ハッシュ化・方針B: 管理者は利用制限入力不可・連動制御）"""
+        if not self.user_manage_container:
+            return
+        self.user_manage_container.clear()
+
+        users_data = load_users()
+        users_dict = users_data.get('users', {})
+
+        def calc_future_dt(days: float = 0, hours: float = 0) -> str:
+            target = datetime.now() + timedelta(days=days, hours=hours)
+            return target.strftime('%Y-%m-%d %H:%M')
+
+        with self.user_manage_container:
+            with ui.row().classes('w-full items-center justify-between pb-2'):
+                with ui.row().classes('items-center gap-2'):
+                    ui.icon('manage_accounts', size='md').classes('text-blue-400')
+                    ui.label('ユーザーアカウント管理 (`users.yaml`)').classes('text-h4 font-bold')
+                ui.label('パスワードはソルト付きハッシュで安全に保護されます．一般ユーザーの利用可能日時を制限できます（管理者は常時無制限）').classes('text-xs text-zinc-400')
+
+            # 新規ユーザー追加カード
+            with ui.card().classes('w-full p-5 bg-zinc-900 border border-zinc-800 rounded-xl gap-3'):
+                ui.label('➕ 新規ユーザーの追加').classes('text-lg font-bold text-zinc-100')
+                with ui.row().classes('w-full items-center gap-3'):
+                    add_name = ui.input('ユーザー名 (英数字)').props('outlined dense').classes('w-40')
+                    add_pass = ui.input('パスワード', password=True, password_toggle_button=True).props('outlined dense').classes('w-40')
+                    add_admin = ui.checkbox('管理者権限').classes('text-zinc-300')
+                    add_from = ui.input('利用開始日時', placeholder='例: 2026-10-09 13:00').props('outlined dense').classes('grow')
+                    add_until = ui.input('利用終了日時', placeholder='例: 2026-10-16 13:00').props('outlined dense').classes('grow')
+
+                # 新規追加用のクイック加算ツールバー
+                with ui.row().classes('w-full items-center gap-2 p-2 bg-zinc-950/60 rounded border border-zinc-800/80 text-xs') as add_quick_bar:
+                    ui.label('⏱ 終了日時のクイック設定:').classes('text-zinc-400 font-semibold')
+                    btn_24h = ui.button('+24時間', on_click=lambda: add_until.set_value(calc_future_dt(hours=24))).props('dense outline size=xs')
+                    btn_3d = ui.button('+3日', on_click=lambda: add_until.set_value(calc_future_dt(days=3))).props('dense outline size=xs')
+                    btn_7d = ui.button('+7日 (1週間)', on_click=lambda: add_until.set_value(calc_future_dt(days=7))).props('dense outline size=xs')
+                    btn_30d = ui.button('+30日 (1ヶ月)', on_click=lambda: add_until.set_value(calc_future_dt(days=30))).props('dense outline size=xs')
+
+                    ui.label('│ 任意加算:').classes('text-zinc-500 mx-1')
+                    add_custom_days = ui.number('日', value=1, min=0, max=365).props('dense outlined size=xs').classes('w-16')
+                    add_custom_hours = ui.number('時間', value=0, min=0, max=23).props('dense outlined size=xs').classes('w-16')
+
+                    def apply_custom_to_add():
+                        d = float(add_custom_days.value or 0)
+                        h = float(add_custom_hours.value or 0)
+                        add_until.set_value(calc_future_dt(days=d, hours=h))
+
+                    btn_apply = ui.button('セット', on_click=apply_custom_to_add).props('dense outline color=primary size=xs')
+                    btn_clear = ui.button('クリア', on_click=lambda: add_until.set_value('')).props('dense outline color=grey size=xs')
+
+                # 管理者フラグによる新規入力欄の有効/無効連動
+                def update_add_fields(is_adm: bool) -> None:
+                    if is_adm:
+                        add_from.disable()
+                        add_until.disable()
+                        add_from.set_value('')
+                        add_until.set_value('')
+                        for w in (btn_24h, btn_3d, btn_7d, btn_30d, add_custom_days, add_custom_hours, btn_apply, btn_clear):
+                            w.disable()
+                        add_quick_bar.classes(add='opacity-40 pointer-events-none')
+                    else:
+                        add_from.enable()
+                        add_until.enable()
+                        for w in (btn_24h, btn_3d, btn_7d, btn_30d, add_custom_days, add_custom_hours, btn_apply, btn_clear):
+                            w.enable()
+                        add_quick_bar.classes(remove='opacity-40 pointer-events-none')
+
+                add_admin.on_value_change(lambda e: update_add_fields(bool(e.value)))
+
+                async def handle_add_user() -> None:
+                    u_name = (add_name.value or '').strip()
+                    u_pass = (add_pass.value or '').strip()
+                    if not u_name or not u_pass:
+                        ui.notify('ユーザー名とパスワードを入力してください．', type='warning')
+                        return
+                    if u_name in users_dict:
+                        ui.notify(f'ユーザー「{u_name}」は既に存在します．', type='negative')
+                        return
+
+                    is_adm = bool(add_admin.value)
+                    users_dict[u_name] = {
+                        'password': hash_password(u_pass),
+                        'is_admin': is_adm,
+                        'valid_from': '' if is_adm else (add_from.value or '').strip(),
+                        'valid_until': '' if is_adm else (add_until.value or '').strip(),
+                    }
+                    save_users(users_data)
+                    ui.notify(f'ユーザー「{u_name}」を追加しました．', type='positive')
+                    self.refresh_user_management()
+
+                with ui.row().classes('w-full justify-end pt-1'):
+                    ui.button('ユーザーを登録', on_click=handle_add_user).props('color=primary dense').classes('w-44')
+
+            # 既存ユーザー一覧カード
+            ui.label(f'登録済みユーザー一覧（全 {len(users_dict)} アカウント）').classes('text-base font-bold text-zinc-200 mt-4')
+
+            for u_name, u_info in sorted(users_dict.items()):
+                with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-800 rounded-xl gap-3'):
+                    is_current_user = (u_name == self.username)
+                    is_user_admin = bool(u_info.get('is_admin', False))
+
+                    with ui.row().classes('w-full items-center justify-between'):
+                        with ui.row().classes('items-center gap-2'):
+                            ui.icon('person', size='sm').classes('text-blue-400')
+                            ui.label(u_name).classes('text-lg font-bold text-white')
+                            if is_user_admin:
+                                ui.badge('Admin', color='primary').props('outline')
+
+                        if is_user_admin:
+                            ui.badge('常時利用可能 (管理者)', color='positive').props('outline')
+                        else:
+                            is_allowed, status_msg = is_user_within_allowed_period(u_info)
+                            if is_allowed:
+                                ui.badge('利用可能', color='positive').props('outline')
+                            else:
+                                ui.badge(f'利用不可: {status_msg}', color='negative').props('outline')
+
+                    with ui.row().classes('w-full items-center gap-3 pt-1'):
+                        pass_input = ui.input(
+                            '新パスワード',
+                            placeholder='変更時のみ入力',
+                            password=True,
+                            password_toggle_button=True,
+                        ).props('outlined dense').classes('w-44')
+
+                        admin_check = ui.checkbox('管理者権限', value=is_user_admin).classes('text-zinc-300')
+                        if is_current_user:
+                            admin_check.disable()
+
+                        from_input = ui.input(
+                            '利用開始日時',
+                            value='' if is_user_admin else str(u_info.get('valid_from', ''))
+                        ).props('outlined dense placeholder="YYYY-MM-DD HH:MM"').classes('grow')
+                        until_input = ui.input(
+                            '利用終了日時',
+                            value='' if is_user_admin else str(u_info.get('valid_until', ''))
+                        ).props('outlined dense placeholder="YYYY-MM-DD HH:MM"').classes('grow')
+
+                    # 既存ユーザー用のクイック加算ツールバー
+                    with ui.row().classes('w-full items-center gap-2 p-1.5 bg-zinc-950/40 rounded border border-zinc-800 text-xs') as row_quick_bar:
+                        ui.label('⏱ 終了日時のクイック加算:').classes('text-zinc-400 font-semibold')
+                        r_btn_24h = ui.button('+24h', on_click=lambda target_in=until_input: target_in.set_value(calc_future_dt(hours=24))).props('dense outline size=xs')
+                        r_btn_3d = ui.button('+3日', on_click=lambda target_in=until_input: target_in.set_value(calc_future_dt(days=3))).props('dense outline size=xs')
+                        r_btn_7d = ui.button('+7日', on_click=lambda target_in=until_input: target_in.set_value(calc_future_dt(days=7))).props('dense outline size=xs')
+                        r_btn_30d = ui.button('+30日', on_click=lambda target_in=until_input: target_in.set_value(calc_future_dt(days=30))).props('dense outline size=xs')
+
+                        ui.label('│').classes('text-zinc-600')
+                        row_days = ui.number('日', value=7, min=0, max=365).props('dense outlined size=xs').classes('w-14')
+                        row_hours = ui.number('時間', value=0, min=0, max=23).props('dense outlined size=xs').classes('w-14')
+
+                        def apply_row_custom(target_in=until_input, rd=row_days, rh=row_hours):
+                            d = float(rd.value or 0)
+                            h = float(rh.value or 0)
+                            target_in.set_value(calc_future_dt(days=d, hours=h))
+
+                        r_btn_apply = ui.button('加算セット', on_click=apply_row_custom).props('dense outline color=primary size=xs')
+                        r_btn_clear = ui.button('制限解除 (空欄)', on_click=lambda target_in=until_input: target_in.set_value('')).props('dense outline color=grey size=xs')
+
+                    # 管理者フラグに応じた入力制限（方針B）
+                    def update_row_fields(is_adm: bool, fi=from_input, ui_=until_input, bar=row_quick_bar,
+                                          widgets=(r_btn_24h, r_btn_3d, r_btn_7d, r_btn_30d, row_days, row_hours, r_btn_apply, r_btn_clear)):
+                        if is_adm:
+                            fi.disable()
+                            ui_.disable()
+                            fi.set_value('')
+                            ui_.set_value('')
+                            for w in widgets:
+                                w.disable()
+                            bar.classes(add='opacity-40 pointer-events-none')
+                        else:
+                            fi.enable()
+                            ui_.enable()
+                            for w in widgets:
+                                w.enable()
+                            bar.classes(remove='opacity-40 pointer-events-none')
+
+                    # 初期状態の反映
+                    update_row_fields(is_user_admin)
+                    admin_check.on_value_change(lambda e, upd=update_row_fields: upd(bool(e.value)))
+
+                    with ui.row().classes('w-full justify-end items-center gap-3 pt-1'):
+                        async def handle_update(target=u_name, p=pass_input, a=admin_check, vf=from_input, vu=until_input):
+                            new_admin_val = bool(a.value)
+
+                            # 管理者権限剥奪の安全ガード
+                            if users_dict[target].get('is_admin') and not new_admin_val:
+                                if target == self.username:
+                                    ui.notify('自分自身の管理者権限を外すことはできません．', type='negative')
+                                    a.value = True
+                                    return
+                                admin_count = sum(1 for u in users_dict.values() if u.get('is_admin', False))
+                                if admin_count <= 1:
+                                    ui.notify('システム内に管理者がいなくなるため、最後の管理者権限を外すことはできません．', type='negative')
+                                    a.value = True
+                                    return
+
+                            new_pw = (p.value or '').strip()
+                            if new_pw:
+                                users_dict[target]['password'] = hash_password(new_pw)
+
+                            users_dict[target]['is_admin'] = new_admin_val
+                            # 管理者の場合は日時設定を空文字にして保存
+                            users_dict[target]['valid_from'] = '' if new_admin_val else (vf.value or '').strip()
+                            users_dict[target]['valid_until'] = '' if new_admin_val else (vu.value or '').strip()
+                            save_users(users_data)
+                            ui.notify(f'ユーザー「{target}」の情報を更新しました．', type='positive')
+                            self.refresh_user_management()
+
+                        async def handle_delete(target=u_name):
+                            if target == self.username:
+                                ui.notify('現在ログイン中の自分自身を削除することはできません．', type='negative')
+                                return
+                            if len(users_dict) <= 1:
+                                ui.notify('最後の1アカウントは削除できません．', type='negative')
+                                return
+                            del users_dict[target]
+                            save_users(users_data)
+                            ui.notify(f'ユーザー「{target}」を削除しました．', type='info')
+                            self.refresh_user_management()
+
+                        ui.button('変更を保存', on_click=handle_update).props('outline color=primary dense')
+                        if not is_current_user:
+                            ui.button('削除', on_click=handle_delete).props('outline color=negative dense')
+
     async def refresh_all(self) -> None:
         await self.refresh_views()
         await self.refresh_final_video()
@@ -2082,6 +2452,7 @@ class SlideNarratorApp:
 
         current_username = app.storage.user.get('username', '')
         is_guest = (current_username == 'guest')
+        is_admin = app.storage.user.get('is_admin', False)
 
         def logout() -> None:
             app.storage.user.clear()
@@ -2090,14 +2461,16 @@ class SlideNarratorApp:
         with ui.header().classes('items-center w-full px-4 bg-slate-900 border-b border-slate-800'):
             ui.label('🎓 Slide Narrator').classes('text-h5 text-white')
             ui.space()
-            username = app.storage.user.get('username', '')
-            if username:
-                ui.label(f'👤 {username}').classes('text-caption text-slate-400 mr-2')
+            if current_username:
+                badge_role = ' (管理者)' if is_admin else ''
+                ui.label(f'👤 {current_username}{badge_role}').classes('text-caption text-slate-400 mr-2')
             ui.button('ログアウト', on_click=logout).props('dense outline size=sm color=white').classes('mr-3')
             ui.label('TAKAGO_LAB. 2026').classes('text-subtitle2 font-mono tracking-wider text-slate-300 mr-2')
 
         with ui.left_drawer(value=True).props('width=320').classes('p-4'):
             ui.label('プロジェクト設定').classes('text-h5')
+            ui.label(f'作業場所: webui_uploads/{self.username}/').classes('text-[11px] text-zinc-400 font-mono pb-1')
+
             self.uploader = (
                 ui.upload(
                     label='プレゼンテーションPDFを選択',
@@ -2144,7 +2517,7 @@ class SlideNarratorApp:
             self.pipeline_buttons = [
                 ui.button('① ナレーション原稿の生成', on_click=lambda: self.pipeline('explain', '① ナレーション原稿を作成中…')).classes('w-full'),
                 ui.button('② 翻訳，字幕生成，ポインタ配置', on_click=lambda: self.pipeline('align', '② 翻訳と字幕，ポインタ配置を決定中…')).classes('w-full'),
-                ui.button('③ ナレーション音声の作成', on_click=lambda: self.pipeline('tts', f'③ ナレーション音声を作成成中…')).classes('w-full'),
+                ui.button('③ ナレーション音声の作成', on_click=lambda: self.pipeline('tts', f'③ ナレーション音声を作成中…')).classes('w-full'),
                 ui.button('④ ナレーションビデオの作成', on_click=lambda: self.pipeline('video', '④ ナレーションビデオを作成中…')).classes('w-full'),
             ]
             ui.separator()
@@ -2161,9 +2534,11 @@ class SlideNarratorApp:
                 tab_simple_edit = ui.tab('📋 ナレーション修正（簡易）')
                 tab_edit = ui.tab('📝 ナレーション修正（詳細）')
                 tab_slide_videos = ui.tab('🎞 ビデオデッキ')
+                tab_logs = ui.tab('📜 ログ')
                 if not is_guest:
                     tab_settings = ui.tab('⚙ 設定')
-                tab_logs = ui.tab('📜 ログ')
+                if is_admin:
+                    tab_user_manage = ui.tab('👥 ユーザー管理')
 
             with ui.tab_panels(tabs, value=tab_gallery).classes('w-full'):
                 with ui.tab_panel(tab_gallery):
@@ -2177,9 +2552,6 @@ class SlideNarratorApp:
                 with ui.tab_panel(tab_slide_videos):
                     ui.label('🎞 ビデオデッキ').classes('text-h5')
                     self.slide_video_gallery = ui.column().classes('w-full')
-                if not is_guest:
-                    with ui.tab_panel(tab_settings):
-                        self.settings_container = ui.column().classes('w-full')
                 with ui.tab_panel(tab_logs):
                     with ui.row().classes('w-full items-center justify-between pb-2'):
                         ui.label('📜 実行ログ履歴').classes('text-h5')
@@ -2188,9 +2560,17 @@ class SlideNarratorApp:
                     if self.log:
                         for line in self.log.splitlines():
                             self.history_log_widget.push(line)
+                if not is_guest:
+                    with ui.tab_panel(tab_settings):
+                        self.settings_container = ui.column().classes('w-full')
+                if is_admin:
+                    with ui.tab_panel(tab_user_manage):
+                        self.user_manage_container = ui.column().classes('w-full')
 
         if not is_guest:
             self.refresh_settings()
+        if is_admin:
+            self.refresh_user_management()
 
     def _mode_changed(self, value: str) -> None:
         self.mode_code = value
@@ -2220,7 +2600,20 @@ class SlideNarratorApp:
 def index_page():
     if not app.storage.user.get('authenticated', False):
         return RedirectResponse('/login')
-    app_instance = SlideNarratorApp()
+
+    username = app.storage.user.get('username', '')
+    users_data = load_users().get('users', {})
+    u_info = users_data.get(username)
+    if not u_info:
+        app.storage.user.clear()
+        return RedirectResponse('/login')
+
+    allowed, err = is_user_within_allowed_period(u_info)
+    if not allowed:
+        app.storage.user.clear()
+        return RedirectResponse('/login')
+
+    app_instance = SlideNarratorApp(username=username)
     app_instance.build()
 
 
@@ -2236,12 +2629,32 @@ def login_page():
     def try_login() -> None:
         username = (username_input.value or '').strip()
         password = password_input.value or ''
-        if USERS.get(username) == password:
-            app.storage.user['authenticated'] = True
-            app.storage.user['username'] = username
-            ui.navigate.to('/')
-        else:
+
+        users_data = load_users()
+        users_dict = users_data.get('users', {})
+        user_info = users_dict.get(username)
+
+        # パスワード検証（平文互換判定含む）
+        if not user_info or not verify_password(password, str(user_info.get('password', ''))):
             ui.notify('ユーザー名またはパスワードが正しくありません．', type='negative')
+            return
+
+        # 既存の平文パスワードだった場合、初回認証成功時に自動でハッシュ化して保存更新
+        stored_pw = str(user_info.get('password', ''))
+        if not stored_pw.startswith('pbkdf2:sha256:'):
+            user_info['password'] = hash_password(password)
+            save_users(users_data)
+
+        # 利用可能日時制限のチェック
+        allowed, reason = is_user_within_allowed_period(user_info)
+        if not allowed:
+            ui.notify(f'ログイン拒否: {reason}', type='negative')
+            return
+
+        app.storage.user['authenticated'] = True
+        app.storage.user['username'] = username
+        app.storage.user['is_admin'] = bool(user_info.get('is_admin', False))
+        ui.navigate.to('/')
 
     with ui.card().classes('absolute-center w-96 p-6 bg-zinc-900 border border-zinc-800 rounded-xl shadow-lg gap-4'):
         with ui.column().classes('w-full items-center gap-1'):
@@ -2256,4 +2669,4 @@ def login_page():
         ui.button('ログイン', on_click=try_login).props('color=primary').classes('w-full mt-2')
 
 
-ui.run(title='Slide Narrator', reload=True, show=False, port=17171, host='0.0.0.0', storage_secret='slide-narrator-session-secret-key-change-in-prod')
+ui.run(title='Slide Narrator', reload=False, show=False, port=17171, host='0.0.0.0', storage_secret='slide-narrator-session-secret-key-change-in-prod')
