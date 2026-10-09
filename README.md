@@ -27,7 +27,7 @@ Turn your PDF presentation slides into narrated lecture videos with AI.
    - システムリソースが不足するのを防ぐため，複数のユーザが同時に利用することはできません
      - 他のユーザが処理中のときは，処理の実行を拒否します．
    - 管理者はユーザごとに利用開始日時と利用終了日時を一つ設定できます
-      
+   - 管理者以外はLLMやTTS，ユーザ辞書の設定はできません（「設定」タブは管理者画面にのみ表示されます）．   
 ![img](screenshot.png)
 
 ## セットアップ(Linuxの場合)
