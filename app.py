@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 import hashlib
 import httpx
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -35,7 +36,7 @@ from typing import Any
 import pymupdf as fitz
 import yaml
 from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
-from nicegui import app, run, ui
+from nicegui import app, run, ui, background_tasks
 from PIL import Image, ImageDraw
 
 from slide_lecture import (
@@ -56,6 +57,18 @@ from tts_filter import (
     make_client as make_tts_filter_client,
     transform_text as tts_filter_transform,
 )
+
+
+# ----------------------------------------------------------------------
+# Constants & UI Styling
+# ----------------------------------------------------------------------
+
+BADGE_COLORS: dict[str, tuple[str, str]] = {
+    'image_subpart': ('bg-red-500/20 text-red-300 border-red-500/40', '注目要素'),
+    'image': ('bg-amber-500/20 text-amber-300 border-amber-500/40', '画像・領域'),
+    'text': ('bg-blue-500/20 text-blue-300 border-blue-500/40', 'テキスト'),
+    'code_line': ('bg-cyan-500/20 text-cyan-300 border-cyan-500/40', 'コード/数式'),
+}
 
 
 # ----------------------------------------------------------------------
@@ -93,6 +106,23 @@ class ExecutionLockManager:
 
 
 GLOBAL_EXECUTION_LOCK = ExecutionLockManager()
+LOGGER = logging.getLogger(__name__)
+
+
+# ----------------------------------------------------------------------
+# File IO Utilities (Atomic File Operations)
+# ----------------------------------------------------------------------
+
+def atomic_write_text(path: Path, content: str, encoding: str = 'utf-8') -> None:
+    """同一ディレクトリに一時ファイルを書き込み、アトミックに置換する共通関数"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f".{path.name}.{secrets.token_hex(4)}.tmp")
+    try:
+        temp_path.write_text(content, encoding=encoding)
+        temp_path.replace(path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
 
 
 # ----------------------------------------------------------------------
@@ -172,10 +202,8 @@ def load_users() -> dict[str, Any]:
 
 
 def save_users(data: dict[str, Any]) -> None:
-    USERS_FILE.write_text(
-        yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
-        encoding='utf-8',
-    )
+    content = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
+    atomic_write_text(USERS_FILE, content)
 
 
 def is_user_within_allowed_period(user_info: dict[str, Any]) -> tuple[bool, str]:
@@ -245,7 +273,6 @@ def user_job_log_file(username: str) -> Path:
 
 
 def append_user_job_log(username: str, line: str) -> None:
-    # ログ本文は状態管理用JSONとは別ファイルに保存する．
     path = user_job_log_file(username)
     stamp = datetime.now().isoformat(timespec='seconds')
     with path.open('a', encoding='utf-8') as f:
@@ -278,9 +305,7 @@ def write_user_job_status(username: str, **updates: Any) -> None:
     status = read_user_job_status(username)
     status.update(updates)
     status['updated_at'] = datetime.now().isoformat(timespec='seconds')
-    temp = path.with_name(path.name + '.tmp')
-    temp.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding='utf-8')
-    temp.replace(path)
+    atomic_write_text(path, json.dumps(status, ensure_ascii=False, indent=2))
 
 
 def safe_notify(*args: Any, **kwargs: Any) -> None:
@@ -297,10 +322,8 @@ def load_config(path: Path) -> dict:
 
 
 def save_config(path: Path, cfg: dict) -> None:
-    path.write_text(
-        yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False),
-        encoding='utf-8',
-    )
+    content = yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False)
+    atomic_write_text(path, content)
 
 
 # ----------------------------------------------------------------------
@@ -508,7 +531,6 @@ class SlideNarratorApp:
         self.lang_code = 'ja'
         self.default_use_vlm: bool = True
         self.slide_visual_modes: dict[str, str] = {}
-        self.force_run = False
         self.edit_page: int | None = None
         self.processing = False
         self._selected_pages: set[int] = set()
@@ -529,6 +551,15 @@ class SlideNarratorApp:
         self.simple_edit_container = None
         self.edit_container = None
         self.slide_video_gallery = None
+        # 差分更新対象の画面部品．ブラウザ接続ごとに独立して保持する．
+        self._simple_textareas: dict[int, Any] = {}
+        self._simple_text_signatures: dict[int, tuple | None] = {}
+        self._video_cards: dict[int, Any] = {}
+        self._video_signatures: dict[int, tuple | None] = {}
+        self._video_grid = None
+        self._output_project_key: str | None = None
+        self._detail_signatures: dict[str, tuple | None] = {}
+        self._final_video_signature: tuple | None = None
         self.final_video_container = None
         self.settings_container = None
         self.user_manage_container = None
@@ -540,12 +571,75 @@ class SlideNarratorApp:
         self.lang_select = None
         self.default_vlm_switch = None
         self.pages_input = None
-        self.force_checkbox = None
         self.pipeline_buttons: list[Any] = []
         self.stage_widgets: dict[str, dict[str, Any]] = {}
         self.pipeline_busy_row = None
         self.pipeline_busy_notice = None
         self.main_action_buttons: list[Any] = []
+
+    # --- クライアントの寿命とジョブの寿命は別に管理する ---
+
+    @staticmethod
+    def _widget_available(widget: Any) -> bool:
+        if widget is None or getattr(widget, 'is_deleted', False):
+            return False
+        try:
+            return not widget.client.is_deleted
+        except (AttributeError, RuntimeError):
+            return False
+
+    def _safe_view_update(self, callback, description: str) -> None:
+        try:
+            callback()
+        except Exception:
+            LOGGER.exception('UI更新に失敗しました（生成処理は継続）: %s', description)
+
+    async def _safe_async_view_update(self, callback, description: str) -> None:
+        try:
+            await callback()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOGGER.exception('UI更新に失敗しました（生成処理は継続）: %s', description)
+
+    def _complete_background_job(self) -> None:
+        # UIが破棄されていてもロック解放を最優先する．
+        self.current_process = None
+        self.processing = False
+        self.current_task = None
+        try:
+            GLOBAL_EXECUTION_LOCK.release()
+        finally:
+            self._safe_view_update(lambda: self.set_processing(False), '処理終了時のボタン更新')
+
+    def _start_background_job(self, worker_factory, *, busy_message: str) -> None:
+        """重複起動の確認とジョブ登録を一箇所で管理する．"""
+        if self.current_task and not self.current_task.done():
+            safe_notify(busy_message, type='warning')
+            return
+        self.current_task = background_tasks.create(worker_factory(), name='slide-narrator-job')
+
+    def _finalize_cancel_request(self, **extra_status: Any) -> None:
+        """中断要求が残ったまま終了した場合にだけ状態を確定する．"""
+        if not self.cancellation_requested:
+            return
+        saved = read_user_job_status(self.username)
+        if saved.get('state') == 'running':
+            self.update_job_status(
+                'cancelled', cancellation_requested=False,
+                message='処理を中断しました',
+                finished_at=datetime.now().isoformat(timespec='seconds'),
+                **extra_status,
+            )
+
+    def _invalidate_page_video_outputs(self, page: int) -> None:
+        """ページの動画・完成動画・完成字幕を無効化する．音声と解析結果は保持する．"""
+        assert self.paths is not None
+        for path in (
+            self.paths.video(page), self.paths.final_video,
+            self.paths.final_ja_srt, self.paths.final_en_srt,
+        ):
+            path.unlink(missing_ok=True)
 
     # --- 認証・権限制御 ---
 
@@ -579,33 +673,36 @@ class SlideNarratorApp:
     def update_job_status(self, state: str | None = None, **updates: Any) -> dict[str, Any]:
         if state is not None:
             updates['state'] = state
+        # 永続化をUI表示に依存させない．書き込み失敗はワーカーに通知する．
         write_user_job_status(self.username, **updates)
         status = read_user_job_status(self.username)
-        if self.job_status_label is not None:
-            try:
-                self.job_status_label.text = self.format_job_status(status)
-            except Exception:
-                pass
+        if self._widget_available(self.job_status_label):
+            self._safe_view_update(
+                lambda: setattr(self.job_status_label, 'text', self.format_job_status(status)),
+                'ジョブ状態表示',
+            )
         return status
 
     def append_job_log(self, line: str) -> None:
         line = str(line)
         append_user_job_log(self.username, line)
-        if self.history_log_widget is not None:
-            self.history_log_widget.push(f'[{datetime.now().strftime("%H:%M:%S")}] {line}')
         self._loaded_log_text = None
+        if self._widget_available(self.history_log_widget):
+            self._safe_view_update(
+                lambda: self.history_log_widget.push(f'[{datetime.now():%H:%M:%S}] {line}'),
+                'ログ表示',
+            )
 
     def clear_job_log(self) -> None:
         clear_user_job_log(self.username)
         self._loaded_log_text = ''
-        if self.history_log_widget is not None:
-            self.history_log_widget.clear()
+        if self._widget_available(self.history_log_widget):
+            self._safe_view_update(self.history_log_widget.clear, 'ログクリア')
 
     def refresh_history_log(self) -> None:
-        if self.history_log_widget is None:
+        if not self._widget_available(self.history_log_widget):
             return
         contents = read_user_job_log(self.username)
-        # すでに読み込み済みと同じ内容であればスキップ
         if contents == self._loaded_log_text:
             return
         try:
@@ -661,6 +758,101 @@ class SlideNarratorApp:
                 stage_key = self.stage_button_key(task_name)
         return stage_key
 
+    @staticmethod
+    def _file_signature(path: Path) -> tuple[int, int, int] | None:
+        """更新内容の検知．存在しないファイルは None とする．"""
+        try:
+            stat = path.stat()
+            return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        except OSError:
+            return None
+
+    def _reset_output_watch(self) -> None:
+        self._simple_textareas.clear()
+        self._simple_text_signatures.clear()
+        self._video_cards.clear()
+        self._video_signatures.clear()
+        self._video_grid = None
+        self._detail_signatures.clear()
+        self._final_video_signature = None
+
+    def poll_generated_outputs(self) -> None:
+        """生成物だけを差分反映する．既存の入力欄・再生中の動画には触れない．"""
+        if not self.paths or not self.pdf:
+            return
+        project_key = str(self.pdf.resolve())
+        if self._output_project_key != project_key:
+            self._output_project_key = project_key
+            self._reset_output_watch()
+            # プロジェクト切替時の全描画は既存の refresh_all が担当する．
+            return
+
+        for page, textarea in list(self._simple_textareas.items()):
+            if not self._widget_available(textarea):
+                self._simple_textareas.pop(page, None)
+                continue
+            path = self.paths.explanation(page)
+            signature = self._file_signature(path)
+            if signature == self._simple_text_signatures.get(page):
+                continue
+            if signature is not None:
+                try:
+                    textarea.value = path.read_text(encoding='utf-8')
+                except OSError:
+                    LOGGER.exception('ナレーションフォームの同期に失敗: %s', path)
+                    continue
+            else:
+                textarea.value = ''
+            self._simple_text_signatures[page] = signature
+
+        if self._video_grid is not None and self._widget_available(self._video_grid):
+            for page in self.active_pages:
+                signature = self._file_signature(self.paths.video(page))
+                if signature != self._video_signatures.get(page) or page not in self._video_cards:
+                    self._replace_video_card(page, signature)
+
+        if self._widget_available(self.edit_container) and self.edit_page in self.active_pages:
+            page = self.edit_page
+            current = {
+                'text': self._file_signature(self.paths.explanation(page)),
+                'align': self._file_signature(self.paths.alignment(page)),
+                'audio': self._file_signature(self.paths.audio(page)),
+            }
+            if self._detail_signatures and current != self._detail_signatures:
+                # 詳細画面は現在表示している一枚だけを構築し直す．
+                background_tasks.create(self._safe_async_view_update(
+                    self.refresh_editor, '生成結果による詳細画面の更新'))
+            self._detail_signatures = current
+
+        final_signature = self._file_signature(self.paths.final_video)
+        if final_signature != self._final_video_signature:
+            self._final_video_signature = final_signature
+            background_tasks.create(self._safe_async_view_update(
+                self.refresh_final_video, '完成動画の差分更新'))
+
+    def _replace_video_card(self, page: int, signature: tuple | None = None) -> None:
+        """指定スライドのカードだけを置換．他の動画プレーヤーは保持する．"""
+        if not self.paths or self._video_grid is None:
+            return
+        card = self._video_cards.get(page)
+        if card is None or not self._widget_available(card):
+            with self._video_grid:
+                card = ui.card().classes('w-full p-3 gap-2 rounded-lg bg-zinc-800 border border-zinc-700 shadow-sm')
+            self._video_cards[page] = card
+        else:
+            card.clear()
+        with card:
+            video = self.paths.video(page)
+            img = self.paths.page_image(page)
+            if video.exists():
+                ui.video(file_url(video)).classes('w-full rounded shadow-sm')
+            else:
+                if img.exists():
+                    ui.image(file_url(img)).classes('w-full opacity-60 rounded shadow-sm')
+                ui.label('（単体動画 未生成）').classes('text-xs text-orange-400 font-medium')
+            ui.label(f'スライド {page}').classes('text-sm font-bold text-white self-center pt-1')
+        self._video_signatures[page] = signature if signature is not None else self._file_signature(self.paths.video(page))
+
     def refresh_job_status(self) -> None:
         """ポーリング時に画面上のボタン・進捗バー群を同期"""
         allowed_now = self.write_access_allowed(notify=False)
@@ -677,17 +869,24 @@ class SlideNarratorApp:
 
         if globally_busy:
             status = read_user_job_status(owner_name) if owner_name else {}
-            # ロック解放直前の completed/failed/cancelled 状態を running に上書きしない．
             status = {**status, 'stage': status.get('stage') or GLOBAL_EXECUTION_LOCK.task_name or '処理中'}
         else:
             status = read_user_job_status(self.username)
             if status.get('state') == 'running':
                 status = {**status, 'state': 'failed', 'message': '実行中状態を確認できません（サーバ再起動等の可能性があります）'}
 
+        # 再ログイン後の新しい画面にも，状態ファイルの内容を反映する．
+        own_status = read_user_job_status(self.username)
+        if self._widget_available(self.job_status_label):
+            self._safe_view_update(
+                lambda: setattr(self.job_status_label, 'text', self.format_job_status(
+                    status if globally_busy and owner_name == self.username else own_status)),
+                '再接続後の処理状態表示',
+            )
+
         active_key = self.get_active_stage_key(status)
         owner_is_self = globally_busy and owner_name == self.username
 
-        # 他ユーザー実行中の警告表示
         if self.pipeline_busy_row is not None and self.pipeline_busy_notice is not None:
             try:
                 if globally_busy and not owner_is_self:
@@ -698,14 +897,17 @@ class SlideNarratorApp:
             except Exception:
                 pass
 
+        if owner_name == self.username and globally_busy:
+            self.processing = True  # 表示のためだけ．実行主体はowner_appのまま変更しない．
+        elif not globally_busy:
+            self.processing = False
+
         owner_app = GLOBAL_EXECUTION_LOCK.owner_app if globally_busy else None
         cancel_pending = bool(owner_app and owner_app.cancellation_requested)
         completed_stages = status.get('completed_stages', [])
 
-        # 現在実行中ステージのインデックス（通過済み判定用）
         active_idx = ORDERED_STAGES.index(active_key) if (active_key in ORDERED_STAGES) else -1
 
-        # ステージボタンおよびプログレスバー群の更新
         for key, w in self.stage_widgets.items():
             btn = w['button']
             box = w['box']
@@ -721,7 +923,6 @@ class SlideNarratorApp:
                 key_idx = ORDERED_STAGES.index(key) if key in ORDERED_STAGES else -1
 
                 if owner_is_self and status.get('state') == 'running' and key == active_key:
-                    # 【現在実行中のステージ】
                     btn.props('color=primary')
                     box.classes(remove='hidden')
                     p_spinner.classes(remove='hidden')
@@ -753,7 +954,6 @@ class SlideNarratorApp:
                     self.set_button_enabled_visual(btn, not cancel_pending)
 
                 elif owner_is_self and (key in completed_stages or (active_idx >= 0 and key_idx < active_idx)):
-                    # 【通過・完了済みの前工程ステージ】
                     box.classes(remove='hidden')
                     p_spinner.classes(add='hidden')
                     p_label.text = '完了 (100％)'
@@ -839,7 +1039,7 @@ class SlideNarratorApp:
             self.request_views_refresh()
 
     def request_views_refresh(self) -> None:
-        asyncio.create_task(self.refresh_views())
+        background_tasks.create(self._safe_async_view_update(self.refresh_views, '全画面の再描画'), name=f'refresh-{self.username}')
 
     async def refresh_views(self) -> None:
         await self.refresh_gallery()
@@ -848,24 +1048,11 @@ class SlideNarratorApp:
         await self.refresh_slide_videos()
 
     def debounce_refresh_views(self, stages: tuple[str, ...]) -> None:
-        """進捗更新時に過剰な再描画タスクが連続生成されるのを防止"""
-        if self._refresh_debounce_task and not self._refresh_debounce_task.done():
-            return
-
-        async def _runner():
-            await asyncio.sleep(0.1)
-            if any(s in ('explain', 'align') for s in stages):
-                await self.refresh_simple_editor()
-                await self.refresh_editor()
-            if any(s in ('tts', 'video') for s in stages):
-                await self.refresh_slide_videos()
-                await self.refresh_editor()
-
-        self._refresh_debounce_task = asyncio.create_task(_runner())
+        """画面全体の再構築はしない．各接続のタイマーで差分を検出する．"""
+        self._safe_view_update(self.poll_generated_outputs, '生成結果の差分反映')
 
     def refresh_output_views_on_tab_change(self) -> None:
-        asyncio.create_task(self.refresh_slide_videos())
-        asyncio.create_task(self.refresh_final_video())
+        self._safe_view_update(self.poll_generated_outputs, 'タブ切替時の差分更新')
         self.refresh_history_log()
 
     # --- プロジェクト一覧・名前・削除 ---
@@ -964,13 +1151,20 @@ class SlideNarratorApp:
     async def select_existing_project(self, project_id: str | None) -> None:
         if not project_id:
             return
-        if GLOBAL_EXECUTION_LOCK.is_locked():
+        if GLOBAL_EXECUTION_LOCK.is_locked() and GLOBAL_EXECUTION_LOCK.current_user != self.username:
             ui.notify('処理中はプロジェクトを切り替えられません．', type='warning')
             self.refresh_project_list()
             return
         if not re.fullmatch(r"\d{8}\.[A-Za-z0-9_]{4,12}", str(project_id)):
             ui.notify('プロジェクトIDが不正です．', type='negative')
             self.refresh_project_list()
+            return
+        if (GLOBAL_EXECUTION_LOCK.is_locked() and
+                GLOBAL_EXECUTION_LOCK.current_user == self.username and
+                GLOBAL_EXECUTION_LOCK.owner_app is not None and
+                GLOBAL_EXECUTION_LOCK.owner_app.pdf is not None and
+                project_id != GLOBAL_EXECUTION_LOCK.owner_app.pdf.parent.name):
+            safe_notify('生成中は別プロジェクトに切り替えられません．', type='warning')
             return
         project_dir = (self.projects_dir / project_id).resolve()
         if project_dir.parent != self.projects_dir.resolve() or not project_dir.is_dir():
@@ -996,9 +1190,7 @@ class SlideNarratorApp:
             self.slide_visual_modes = self.proj_cfg.get('slide_visual_modes', {})
             self.images = await run.io_bound(ensure_page_images, self.paths, int(self.cfg.get('pdf', {}).get('dpi', 120)))
             marker = user_last_project_file(self.username)
-            temp_marker = marker.with_name(marker.name + '.tmp')
-            temp_marker.write_text(json.dumps({'project_id': project_id}, ensure_ascii=False), encoding='utf-8')
-            temp_marker.replace(marker)
+            atomic_write_text(marker, json.dumps({'project_id': project_id}, ensure_ascii=False))
             self.apply_pages_spec(self.proj_cfg.get('pages', ''), save_and_refresh=False)
             self.refresh_project_widgets()
             self.refresh_project_list()
@@ -1081,7 +1273,7 @@ class SlideNarratorApp:
                     last_id = ''
                 if last_id == deleted_id:
                     if remaining:
-                        marker.write_text(json.dumps({'project_id': remaining[0].parent.name}, ensure_ascii=False), encoding='utf-8')
+                        atomic_write_text(marker, json.dumps({'project_id': remaining[0].parent.name}, ensure_ascii=False))
                     else:
                         marker.unlink(missing_ok=True)
             self.refresh_project_list()
@@ -1132,9 +1324,7 @@ class SlideNarratorApp:
             save_project_json(self.paths.root, self.proj_cfg)
 
             marker = user_last_project_file(self.username)
-            temp_marker = marker.with_name(marker.name + '.tmp')
-            temp_marker.write_text(json.dumps({'project_id': project_id}, ensure_ascii=False), encoding='utf-8')
-            temp_marker.replace(marker)
+            atomic_write_text(marker, json.dumps({'project_id': project_id}, ensure_ascii=False))
 
             self.mode_code = self.proj_cfg.get('mode') or self.cfg.get('mode', 'lecture')
             self.lang_code = self.proj_cfg.get('language') or self.cfg.get('language', 'ja')
@@ -1149,7 +1339,6 @@ class SlideNarratorApp:
             await self.refresh_all()
             ui.notify(f'新しいプロジェクト「{self.project_display_name(target_pdf)}」を作成しました．', type='positive')
         except Exception as exc:
-            # 不完全なアップロードだけを片付け，既存プロジェクトには触れない．
             shutil.rmtree(project_dir, ignore_errors=True)
             ui.notify(f'プロジェクトの作成に失敗しました: {exc}', type='negative')
             self.refresh_project_list()
@@ -1169,7 +1358,7 @@ class SlideNarratorApp:
                 if not projects:
                     return
                 project_id = projects[0].parent.name
-                marker.write_text(json.dumps({'project_id': project_id}, ensure_ascii=False), encoding='utf-8')
+                atomic_write_text(marker, json.dumps({'project_id': project_id}, ensure_ascii=False))
             await self.select_existing_project(project_id)
             if self.read_only:
                 safe_notify('利用可能時間外のため，閲覧モードでプロジェクトを復元しました．', type='info')
@@ -1225,6 +1414,78 @@ class SlideNarratorApp:
         self._selected_pages = set()
         self._on_pages_updated(sync_input=True, save=True, refresh=True)
 
+    # --- 生成データ初期化（PDF・設定・ページ画像は保存） ---
+
+    def confirm_reset_generated_data(self) -> None:
+        if not self.write_access_allowed() or not self.paths or not self.pdf:
+            safe_notify('先にプロジェクトを選択してください．', type='warning')
+            return
+        if GLOBAL_EXECUTION_LOCK.is_locked():
+            safe_notify('生成処理中は生成データを削除できません．', type='warning')
+            return
+
+        # 確認したプロジェクトと実際に削除するプロジェクトが一致するか再確認する．
+        target_pdf = self.pdf.resolve()
+        with ui.dialog() as dialog, ui.card().classes('min-w-[340px] max-w-lg p-5 gap-3'):
+            ui.label('生成データを削除しますか？').classes('text-lg font-bold text-red-400')
+            ui.label('このプロジェクトのナレーション原稿，翻訳・ポインタ情報，音声，単体動画，完成動画と字幕を削除します．')
+            ui.label('元PDF，プロジェクト名・設定，スライド画像は残します．削除後に自動生成は開始しません．この操作は取り消せません．').classes('text-sm text-zinc-400')
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('キャンセル', on_click=dialog.close).props('flat')
+
+                async def confirm() -> None:
+                    dialog.close()
+                    await self.reset_generated_data(target_pdf)
+
+                ui.button('削除する', on_click=confirm).props('color=negative')
+        dialog.open()
+
+    async def reset_generated_data(self, target_pdf: Path) -> None:
+        if not self.write_access_allowed():
+            return
+        # 他ユーザの生成や削除との競合を避けるため，削除操作自体も排他制御する．
+        acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, '生成データ削除', self)
+        if not acquired:
+            safe_notify('別の処理が実行中です．生成データを削除できません．', type='warning')
+            return
+        try:
+            if not self.pdf or self.pdf.resolve() != target_pdf or not self.paths:
+                safe_notify('プロジェクトが変更されたため，削除を取りやめました．', type='warning')
+                return
+            paths = self.paths
+            expected_root = target_pdf.with_name(target_pdf.stem + '_lecture')
+            if paths.root.resolve() != expected_root.resolve():
+                raise RuntimeError('削除対象ディレクトリを検証できません')
+
+            # プロジェクト設定(project.json)とpages/を含むディレクトリ全体は削除しない．
+            for directory in (paths.explanations_dir, paths.audio_dir, paths.video_dir):
+                if directory.exists():
+                    shutil.rmtree(directory)
+
+            # slide_lecture.py のforce処理同様，最終出力を初期化する．
+            # project.json やPDF，ユーザ別ジョブ履歴には触れない．
+            for output in (paths.final_video, paths.final_ja_srt, paths.final_en_srt):
+                output.unlink(missing_ok=True)
+            # 完成動画と同じstemで生成される一時・派生出力も対象にする．
+            for output in paths.root.glob(f'{target_pdf.stem}*'):
+                if output.is_file():
+                    output.unlink()
+
+            self.edit_page = self.active_pages[0] if self.active_pages else None
+            self.update_job_status('idle', stage='', message='生成データを削除しました',
+                                   completed_stages=[], progress=None, current_page=None,
+                                   current_index=None, total_count=None,
+                                   cancellation_requested=False)
+            self.append_job_log('[RESET] 生成データを削除しました（元PDF・設定・ページ画像は保持）')
+            await self.refresh_all()
+            safe_notify('生成データを削除しました．生成ボタンから作り直せます．', type='positive')
+        except Exception as exc:
+            LOGGER.exception('生成データの削除に失敗しました')
+            safe_notify(f'生成データの削除に失敗しました: {exc}', type='negative')
+        finally:
+            GLOBAL_EXECUTION_LOCK.release()
+            self.refresh_job_status()
+
     # --- パイプライン実行・中断制御 ---
 
     def confirm_cancel(self) -> None:
@@ -1233,7 +1494,7 @@ class SlideNarratorApp:
             ui.label('実行中の処理によっては，現在の工程が戻るまで停止に時間がかかります．').classes('text-sm text-zinc-400')
             with ui.row().classes('w-full justify-end'):
                 ui.button('戻る', on_click=dialog.close).props('flat')
-                ui.button('中断を要求', color='negative', on_click=lambda: (dialog.close(), asyncio.create_task(self.request_cancel())))
+                ui.button('中断を要求', color='negative', on_click=lambda: (dialog.close(), background_tasks.create(self.request_cancel())))
         dialog.open()
 
     async def request_cancel(self) -> None:
@@ -1277,6 +1538,8 @@ class SlideNarratorApp:
 
     def set_processing(self, value: bool) -> None:
         self.processing = value
+        if not any(self._widget_available(b) for b in self.pipeline_buttons):
+            return
         status = read_user_job_status(self.username)
         if value:
             status = {**status, 'state': 'running'}
@@ -1298,8 +1561,6 @@ class SlideNarratorApp:
             '--lang', self.lang_code,
             '--visual-mode', 'vlm' if self.default_use_vlm else 'pdf',
         ]
-        if self.force_run:
-            args.append('--force')
         spec = self.pages_spec.strip()
         if spec and spec != 'none':
             args.extend(['--pages', spec])
@@ -1323,10 +1584,10 @@ class SlideNarratorApp:
     async def pipeline(self, stage: str, initial_title: str) -> None:
         if not self.write_access_allowed():
             return
-        if self.current_task and not self.current_task.done():
-            safe_notify('このユーザーの生成処理はすでに実行中です．', type='warning')
-            return
-        self.current_task = asyncio.create_task(self._pipeline_worker(stage, initial_title))
+        self._start_background_job(
+            lambda: self._pipeline_worker(stage, initial_title),
+            busy_message='このユーザーの生成処理はすでに実行中です．',
+        )
 
     def _determine_starting_stage(self, target_stage: str) -> str:
         """必要な前工程の成果物を確認し，実行開始ステージを決定する．"""
@@ -1347,7 +1608,6 @@ class SlideNarratorApp:
             for p in self.active_pages
         )
 
-        # 選択された工程までに必要な最初の未完了工程から開始する．
         if stage_index >= ORDERED_STAGES.index('explain') and has_missing_explain:
             return 'explain'
         if stage_index >= ORDERED_STAGES.index('align') and has_missing_align:
@@ -1371,9 +1631,6 @@ class SlideNarratorApp:
             return
 
         from_stage = self._determine_starting_stage(stage)
-        # 「キャッシュを破棄してやり直す」が指定された場合は，選択工程までを最初から作り直す．
-        if self.force_run:
-            from_stage = 'explain'
         first_idx = ORDERED_STAGES.index(from_stage)
         target_idx = ORDERED_STAGES.index(stage)
         stages_to_run = ORDERED_STAGES[first_idx:target_idx + 1]
@@ -1436,10 +1693,6 @@ class SlideNarratorApp:
                 self.append_job_log(f'=== {stage_title} 開始: --from {run_stage} ===')
 
                 args = self.base_args()
-                # --force は最初の起動時だけ付ける．後続の起動で先行成果物を消したり，
-                # 先行工程を繰り返し強制生成したりしないようにする．
-                if run_index > 0 and '--force' in args:
-                    args.remove('--force')
                 cmd = [
                     sys.executable, '-u', 'slide_lecture.py',
                     str(self.pdf), '--from', run_stage, *args,
@@ -1475,8 +1728,6 @@ class SlideNarratorApp:
                             p_num = p_data.get('page')
                             msg = p_data.get('message', '')
 
-                            # slide_lecture.py は --from align/tts/video でもキャッシュ確認のため
-                            # 先行工程を通るため，今回実行している工程の進捗だけを表示する．
                             effective_phase = 'video' if phase == 'concat' else phase
                             if effective_phase != run_stage:
                                 continue
@@ -1493,7 +1744,6 @@ class SlideNarratorApp:
                             )
                             self.debounce_refresh_views((run_stage,))
                         except Exception:
-                            # 進捗行の解析失敗で本体処理やログ保存を止めない．
                             pass
 
                     await asyncio.sleep(0.01)
@@ -1544,7 +1794,6 @@ class SlideNarratorApp:
                 )
                 self.debounce_refresh_views((run_stage,))
 
-
             if succeeded and not cancelled:
                 self.update_job_status(
                     'completed', stage=stage,
@@ -1564,12 +1813,28 @@ class SlideNarratorApp:
                         finished_at=datetime.now().isoformat(timespec='seconds'),
                     )
 
-            try:
-                await self.refresh_all()
-            except Exception:
-                pass
+            await self._safe_async_view_update(self.refresh_all, '処理完了後の全画面更新')
 
         except asyncio.CancelledError:
+            proc = self.current_process
+            if proc is not None and proc.returncode is None:
+                try:
+                    if sys.platform != 'win32':
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                    else:
+                        proc.terminate()
+                    await asyncio.wait_for(proc.wait(), timeout=10)
+                except asyncio.TimeoutError:
+                    if proc.returncode is None:
+                        if sys.platform != 'win32':
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                        else:
+                            proc.kill()
+                    await proc.wait()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    LOGGER.exception('子プロセスの終了処理に失敗しました')
             self.update_job_status(
                 'cancelled', stage=current_phase, completed_stages=list(completed_stages),
                 message='処理がキャンセルされました', cancellation_requested=False,
@@ -1584,18 +1849,8 @@ class SlideNarratorApp:
             )
             safe_notify(f'処理に失敗しました: {exc}', type='negative')
         finally:
-            if self.cancellation_requested:
-                saved = read_user_job_status(self.username)
-                if saved.get('state') == 'running':
-                    self.update_job_status(
-                        'cancelled', completed_stages=list(completed_stages),
-                        cancellation_requested=False, message='処理を中断しました',
-                        finished_at=datetime.now().isoformat(timespec='seconds'),
-                    )
-            self.current_process = None
-            self.set_processing(False)
-            GLOBAL_EXECUTION_LOCK.release()
-            self.current_task = None
+            self._finalize_cancel_request(completed_stages=list(completed_stages))
+            self._complete_background_job()
 
     # --- 個別スライド操作（原稿再生成・アライメント・TTS） ---
 
@@ -1627,10 +1882,10 @@ class SlideNarratorApp:
     async def regenerate_narration(self, page: int, text_area: Any) -> None:
         if not self.write_access_allowed():
             return
-        if self.current_task and not self.current_task.done():
-            safe_notify('このユーザーの処理はすでに実行中です．', type='warning')
-            return
-        self.current_task = asyncio.create_task(self._regenerate_narration_worker(page, text_area))
+        self._start_background_job(
+            lambda: self._regenerate_narration_worker(page, text_area),
+            busy_message='このユーザーの処理はすでに実行中です．',
+        )
 
     async def _regenerate_narration_worker(self, page: int, text_area: Any) -> None:
         if not self.write_access_allowed() or not self.pdf or not self.paths:
@@ -1683,11 +1938,7 @@ class SlideNarratorApp:
                 self.update_job_status('completed', message=f'スライド {page} のナレーション再生成完了', progress=1.0, finished_at=datetime.now().isoformat(timespec='seconds'))
                 self.append_job_log(f'[REGEN] 完了: 新しいナレーションを保存しました')
                 safe_notify('ナレーションを再生成しました（古い字幕・音声・動画を初期化しました）．', type='positive')
-                try:
-                    await self.refresh_simple_editor()
-                    await self.refresh_editor()
-                except Exception:
-                    pass
+                self._safe_view_update(self.poll_generated_outputs, '個別生成結果の差分更新')
         except asyncio.CancelledError:
             self.update_job_status('cancelled', message='ナレーション再生成を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
             safe_notify('ナレーション再生成を中断しました．', type='warning')
@@ -1695,31 +1946,23 @@ class SlideNarratorApp:
             self.update_job_status('failed', message=str(exc)[:240], finished_at=datetime.now().isoformat(timespec='seconds'))
             safe_notify(f'再生成に失敗しました: {exc}', type='negative')
         finally:
-            if self.cancellation_requested:
-                saved = read_user_job_status(self.username)
-                if saved.get('state') == 'running':
-                    self.update_job_status('cancelled', cancellation_requested=False, message='処理を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
-            self.current_task = None
-            self.set_processing(False)
-            GLOBAL_EXECUTION_LOCK.release()
+            self._finalize_cancel_request()
+            self._complete_background_job()
 
     async def save_and_realign(self, page: int, text: str, page_use_vlm: bool | None = None) -> None:
         if not self.write_access_allowed():
             return
-        if self.current_task and not self.current_task.done():
-            safe_notify('このユーザーの処理はすでに実行中です．', type='warning')
-            return
-        self.current_task = asyncio.create_task(self._save_and_realign_worker(page, text, page_use_vlm))
+        self._start_background_job(
+            lambda: self._save_and_realign_worker(page, text, page_use_vlm),
+            busy_message='このユーザーの処理はすでに実行中です．',
+        )
 
     async def _save_and_realign_worker(self, page: int, text: str, page_use_vlm: bool | None = None) -> None:
         if not self.write_access_allowed() or not self.pdf or not self.paths:
             return
 
         ep = self.paths.explanation(page)
-        ep.parent.mkdir(parents=True, exist_ok=True)
-        temp_ep = ep.with_name(f".{ep.name}.tmp")
-        temp_ep.write_text(text.rstrip() + '\n', encoding='utf-8')
-        temp_ep.replace(ep)
+        atomic_write_text(ep, text.rstrip() + '\n')
 
         mode_str = ('vlm' if page_use_vlm else 'pdf') if page_use_vlm is not None else self.slide_visual_modes.get(str(page), 'vlm' if self.default_use_vlm else 'pdf')
         self.slide_visual_modes[str(page)] = mode_str
@@ -1751,20 +1994,13 @@ class SlideNarratorApp:
 
             if not self.cancellation_requested:
                 alp = self.paths.alignment(page)
-                alp.parent.mkdir(parents=True, exist_ok=True)
-                temp_alp = alp.with_name(f".{alp.name}.tmp")
-                temp_alp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
-                temp_alp.replace(alp)
+                atomic_write_text(alp, json.dumps(data, ensure_ascii=False, indent=2))
 
                 self.paths.cleanup_downstream(page, include_alignment=False)
                 self.update_job_status('completed', message=f'スライド {page} の解析完了', progress=1.0, finished_at=datetime.now().isoformat(timespec='seconds'))
                 self.append_job_log(f'[ALIGN] 完了: 字幕・ポインタアライメントを保存しました')
                 safe_notify(f'スライド {page} の字幕とポインタを再生成しました（{mode_label}）．', type='positive')
-                try:
-                    await self.refresh_simple_editor()
-                    await self.refresh_editor()
-                except Exception:
-                    pass
+                self._safe_view_update(self.poll_generated_outputs, '個別生成結果の差分更新')
         except asyncio.CancelledError:
             self.update_job_status('cancelled', message='字幕・ポインタ再解析を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
             safe_notify('解析を中断しました．', type='warning')
@@ -1772,36 +2008,27 @@ class SlideNarratorApp:
             self.update_job_status('failed', message=str(exc)[:240], finished_at=datetime.now().isoformat(timespec='seconds'))
             safe_notify(f'再解析に失敗しました: {exc}', type='negative')
         finally:
-            if self.cancellation_requested:
-                saved = read_user_job_status(self.username)
-                if saved.get('state') == 'running':
-                    self.update_job_status('cancelled', cancellation_requested=False, message='処理を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
-            self.current_task = None
-            self.set_processing(False)
-            GLOBAL_EXECUTION_LOCK.release()
+            self._finalize_cancel_request()
+            self._complete_background_job()
 
     async def save_alignment(self, page: int, rows: list[dict], align_data: dict) -> None:
         if not self.write_access_allowed() or not self.paths:
             return
         alp = self.paths.alignment(page)
         align_data['alignments'] = rows
-        temp_alp = alp.with_name(f".{alp.name}.tmp")
-        temp_alp.write_text(json.dumps(align_data, ensure_ascii=False, indent=2), encoding='utf-8')
-        temp_alp.replace(alp)
+        atomic_write_text(alp, json.dumps(align_data, ensure_ascii=False, indent=2))
 
-        for f in [self.paths.video(page), self.paths.final_video, self.paths.final_ja_srt, self.paths.final_en_srt]:
-            if f.exists():
-                f.unlink()
+        self._invalidate_page_video_outputs(page)
         ui.notify('字幕とポインタの修正を保存しました．', type='positive')
         await self.refresh_editor()
 
     async def generate_slide_tts(self, page: int) -> None:
         if not self.write_access_allowed():
             return
-        if self.current_task and not self.current_task.done():
-            safe_notify('このユーザーの処理はすでに実行中です．', type='warning')
-            return
-        self.current_task = asyncio.create_task(self._generate_slide_tts_worker(page))
+        self._start_background_job(
+            lambda: self._generate_slide_tts_worker(page),
+            busy_message='このユーザーの処理はすでに実行中です．',
+        )
 
     async def _generate_slide_tts_worker(self, page: int) -> None:
         if not self.write_access_allowed() or not self.pdf or not self.paths:
@@ -1839,18 +2066,12 @@ class SlideNarratorApp:
             )
 
             if not self.cancellation_requested:
-                for f in [self.paths.video(page), self.paths.final_video, self.paths.final_ja_srt, self.paths.final_en_srt]:
-                    if f.exists():
-                        f.unlink()
+                self._invalidate_page_video_outputs(page)
 
                 self.update_job_status('completed', message=f'スライド {page} の音声合成完了', progress=1.0, finished_at=datetime.now().isoformat(timespec='seconds'))
                 self.append_job_log(f'[TTS] スライド {page} の音声を保存しました: {out_mp3.name}')
                 safe_notify(f'スライド {page} の音声を合成しました．', type='positive')
-                try:
-                    await self.refresh_editor()
-                    await self.refresh_slide_videos()
-                except Exception:
-                    pass
+                self._safe_view_update(self.poll_generated_outputs, '音声生成結果の差分更新')
         except asyncio.CancelledError:
             self.update_job_status('cancelled', message='音声合成を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
             safe_notify('音声合成を中断しました．', type='warning')
@@ -1858,13 +2079,8 @@ class SlideNarratorApp:
             self.update_job_status('failed', message=str(exc)[:240], finished_at=datetime.now().isoformat(timespec='seconds'))
             safe_notify(f'音声合成に失敗しました: {exc}', type='negative')
         finally:
-            if self.cancellation_requested:
-                saved = read_user_job_status(self.username)
-                if saved.get('state') == 'running':
-                    self.update_job_status('cancelled', cancellation_requested=False, message='処理を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
-            self.current_task = None
-            self.set_processing(False)
-            GLOBAL_EXECUTION_LOCK.release()
+            self._finalize_cancel_request()
+            self._complete_background_job()
 
     # --- UI レンダリング: スライドデッキ / エディタ / ギャラリー ---
 
@@ -1915,6 +2131,8 @@ class SlideNarratorApp:
         if not self.simple_edit_container:
             return
         self.simple_edit_container.clear()
+        self._simple_textareas.clear()
+        self._simple_text_signatures.clear()
         if not self.active_pages or not self.pdf or not self.paths:
             with self.simple_edit_container:
                 ui.label('⚠ 処理対象となるスライドがありません．「スライドデッキ」タブで対象スライドを選択してください．').classes('text-orange-500 dark:text-orange-400')
@@ -1944,6 +2162,8 @@ class SlideNarratorApp:
                                     value=curr_txt,
                                 ).props('outlined').classes('w-full h-[180px]').style('height: 180px; min-height: 180px;')
                                 ta.props('input-style="height: 140px; resize: vertical;"')
+                                self._simple_textareas[p] = ta
+                                self._simple_text_signatures[p] = self._file_signature(txt_path)
 
                                 with ui.row().classes('w-full items-center justify-end gap-3 pt-1'):
                                     self.register_main_action_button(ui.button(
@@ -1972,6 +2192,11 @@ class SlideNarratorApp:
         img = self.paths.page_image(page)
         current_text_path = self.paths.explanation(page)
         current_text = current_text_path.read_text(encoding='utf-8') if current_text_path.exists() else ''
+        self._detail_signatures = {
+            'text': self._file_signature(current_text_path),
+            'align': self._file_signature(self.paths.alignment(page)),
+            'audio': self._file_signature(self.paths.audio(page)),
+        }
 
         page_vmode = self.slide_visual_modes.get(str(page), 'vlm' if self.default_use_vlm else 'pdf')
         page_use_vlm_init = (page_vmode == 'vlm')
@@ -1984,7 +2209,7 @@ class SlideNarratorApp:
                         value=page,
                         label='編集スライド選択',
                     ).classes('min-w-[280px] max-w-[340px]').props('outlined dense')
-                    sel.on_value_change(lambda e: asyncio.create_task(self.select_edit_page(e.value)))
+                    sel.on_value_change(lambda e: background_tasks.create(self.select_edit_page(e.value)))
 
                     ui.button('◀ 前', on_click=self.prev_edit).props(f'disable={idx == 0} outlined dense')
                     ui.button('次 ▶', on_click=self.next_edit).props(f'disable={idx == len(self.active_pages)-1} outlined dense')
@@ -2037,12 +2262,6 @@ class SlideNarratorApp:
 
                 with ui.column().classes('flex-[3] min-w-0 gap-3'):
                     ui.label('🎯 検出された要素一覧（バッジ対応）').classes('text-xs font-semibold text-zinc-400')
-                    badge_colors = {
-                        'image_subpart': ('bg-red-500/20 text-red-300 border-red-500/40', '注目要素'),
-                        'image': ('bg-amber-500/20 text-amber-300 border-amber-500/40', '画像・領域'),
-                        'text': ('bg-blue-500/20 text-blue-300 border-blue-500/40', 'テキスト'),
-                        'code_line': ('bg-cyan-500/20 text-cyan-300 border-cyan-500/40', 'コード/数式'),
-                    }
                     if not blocks:
                         ui.label('（検出された要素はありません）').classes('text-xs text-zinc-500 italic')
                     else:
@@ -2051,7 +2270,7 @@ class SlideNarratorApp:
                                 bid = b.get('block_id')
                                 label = b.get('label') or '名称なし'
                                 btype = b.get('type', 'image_subpart')
-                                style_cls, type_name = badge_colors.get(btype, badge_colors['image_subpart'])
+                                style_cls, type_name = BADGE_COLORS.get(btype, BADGE_COLORS['image_subpart'])
 
                                 with ui.row().classes(
                                     'w-full items-center justify-between p-2 rounded bg-zinc-900/90 '
@@ -2110,24 +2329,18 @@ class SlideNarratorApp:
         if not self.slide_video_gallery:
             return
         self.slide_video_gallery.clear()
+        self._video_cards.clear()
+        self._video_signatures.clear()
+        self._video_grid = None
         if not self.paths:
             with self.slide_video_gallery:
                 ui.label('プレゼンテーションPDFを選択してください．').classes('text-blue-500 dark:text-blue-400')
             return
 
         with self.slide_video_gallery:
-            with ui.grid(columns=4).classes('w-full gap-4'):
-                for p in self.active_pages:
-                    vp = self.paths.video(p)
-                    img = self.paths.page_image(p)
-                    with ui.card().classes('w-full p-3 gap-2 rounded-lg bg-zinc-800 border border-zinc-700 shadow-sm'):
-                        if vp.exists():
-                            ui.video(file_url(vp)).classes('w-full rounded shadow-sm')
-                        else:
-                            if img.exists():
-                                ui.image(file_url(img)).classes('w-full opacity-60 rounded shadow-sm')
-                            ui.label('（単体動画 未生成）').classes('text-xs text-orange-400 font-medium')
-                        ui.label(f'スライド {p}').classes('text-sm font-bold text-white self-center pt-1')
+            self._video_grid = ui.grid(columns=4).classes('w-full gap-4')
+        for page in self.active_pages:
+            self._replace_video_card(page)
 
     async def refresh_final_video(self) -> None:
         if not self.final_video_container:
@@ -2152,6 +2365,7 @@ class SlideNarratorApp:
                 ui.label('動画未生成').classes('text-xs text-zinc-500')
 
     async def refresh_all(self) -> None:
+        self._output_project_key = str(self.pdf.resolve()) if self.pdf else None
         await self.refresh_views()
         await self.refresh_final_video()
 
@@ -2278,8 +2492,6 @@ class SlideNarratorApp:
                             vlm_status_label.text = '画像を受信しました．自動解析を開始します…'
                             with vlm_preview_container:
                                 ui.image(file_url(saved_path)).classes('w-full rounded border border-zinc-700 shadow-sm')
-                            # アップロード完了後，そのままVLM解析を開始する．
-                            # 手動ボタンは再解析用として残す．
                             await run_vlm_test()
 
                         vlm_uploader.on_upload(handle_vlm_upload)
@@ -2349,13 +2561,6 @@ class SlideNarratorApp:
                         ts = int(time.time() * 1000)
                         vlm_preview_container.clear()
 
-                        badge_colors = {
-                            'image_subpart': ('bg-red-500/20 text-red-300 border-red-500/40', '注目要素'),
-                            'image': ('bg-amber-500/20 text-amber-300 border-amber-500/40', '画像・領域'),
-                            'text': ('bg-blue-500/20 text-blue-300 border-blue-500/40', 'テキスト'),
-                            'code_line': ('bg-cyan-500/20 text-cyan-300 border-cyan-500/40', 'コード/数式'),
-                        }
-
                         with vlm_preview_container:
                             ui.label('🎯 アライメントプレビュー & 検出要素一覧').classes('text-xs font-bold text-zinc-300 mt-2')
                             with ui.row().classes('w-full items-start gap-4'):
@@ -2370,7 +2575,7 @@ class SlideNarratorApp:
                                                 bid = b.get('block_id')
                                                 label = b.get('label') or '名称なし'
                                                 btype = b.get('type', 'image_subpart')
-                                                style_cls, type_name = badge_colors.get(btype, badge_colors['image_subpart'])
+                                                style_cls, type_name = BADGE_COLORS.get(btype, BADGE_COLORS['image_subpart'])
 
                                                 with ui.row().classes('w-full items-center justify-between p-2 rounded bg-zinc-900/90 border border-zinc-800 hover:border-zinc-700 transition-colors'):
                                                     with ui.row().classes('items-center gap-2 grow'):
@@ -2988,8 +3193,9 @@ class SlideNarratorApp:
             if self.read_only:
                 ui.label('閲覧モード：利用可能時間外のため編集・生成はできません．').classes('text-sm text-amber-400')
             ui.timer(2.0, self.refresh_job_status)
+            ui.timer(2.0, lambda: self._safe_view_update(
+                self.poll_generated_outputs, '生成ファイルの差分同期'))
 
-            # --- 変更点: 見た目のフォームは消し、不可視化して裏方に回す ---
             self.uploader = (
                 ui.upload(
                     auto_upload=True,
@@ -2997,14 +3203,13 @@ class SlideNarratorApp:
                     on_upload=self.load_pdf,
                 )
                 .props('accept=.pdf')
-                .classes('hidden')  # 画面上には表示しない
+                .classes('hidden')
             )
             if self.read_only:
                 self.uploader.disable()
 
             self.uploader.on('added', lambda: self.uploader.run_method('eval', 'if (this.files.length > 1) { this.removeFile(this.files[0]); }'))
 
-            # 上部にあった余分な separator も整理可能
             with ui.row().classes('w-full items-center justify-between mt-2'):
                 ui.label('プロジェクト').classes('text-h6')
                 with ui.row().classes('items-center gap-1'):
@@ -3016,7 +3221,7 @@ class SlideNarratorApp:
                             ui.menu_item('完全削除', on_click=self.request_delete_project).props('dense')
             self.project_select = ui.select(
                 options={}, value=None, label='プロジェクトを選択',
-                on_change=lambda e: asyncio.create_task(self.select_existing_project(e.value)),
+                on_change=lambda e: background_tasks.create(self.select_existing_project(e.value)),
             ).props('outlined dense options-dense').classes('w-full')
             if self.read_only:
                 add_project_button.disable()
@@ -3073,14 +3278,15 @@ class SlideNarratorApp:
                         'indeterminate': p_indet,
                     }
 
-            self.force_checkbox = ui.checkbox('キャッシュを破棄してやり直す', value=False)
-            self.force_checkbox.tooltip('チェックを入れると、生成済みのナレーション・音声・動画ファイルをスキップせずにすべて作り直します．')
-            self.force_checkbox.on_value_change(lambda e: setattr(self, 'force_run', bool(e.value)))
+            self.reset_generated_button = self.register_main_action_button(
+                ui.button('生成データを削除', icon='delete_outline', on_click=self.confirm_reset_generated_data)
+                .props('outline color=negative').classes('w-full mt-2')
+            )
+            self.reset_generated_button.tooltip('元PDF，プロジェクト設定，ページ画像を残し，生成済みの原稿・字幕・音声・動画を削除します．')
 
             if self.read_only:
                 for button in self.pipeline_buttons:
                     button.disable()
-                self.force_checkbox.disable()
                 self.mode_select.disable()
                 self.lang_select.disable()
                 self.default_vlm_switch.disable()
@@ -3142,7 +3348,7 @@ class SlideNarratorApp:
         if is_admin:
             self.refresh_user_management()
 
-        asyncio.create_task(self.restore_last_project())
+        background_tasks.create(self.restore_last_project())
 
     # --- ユーザー入力イベント ---
 
@@ -3157,8 +3363,8 @@ class SlideNarratorApp:
             return
         self.lang_code = value
         self.save_project_settings()
-        asyncio.create_task(self.refresh_simple_editor())
-        asyncio.create_task(self.refresh_editor())
+        background_tasks.create(self.refresh_simple_editor())
+        background_tasks.create(self.refresh_editor())
 
     def _default_vlm_changed(self, value: bool) -> None:
         if not self.write_access_allowed():
@@ -3207,6 +3413,11 @@ def login_page():
     ui.dark_mode().enable()
     ui.colors(primary='#3b82f6')
 
+    # ページを開いた瞬間にロック中か判定（タイマーを使わないためエラーが出ません）
+    is_busy = GLOBAL_EXECUTION_LOCK.is_locked()
+    busy_user = GLOBAL_EXECUTION_LOCK.current_user or '誰か'
+    task_label = GLOBAL_EXECUTION_LOCK.task_name or '処理'
+
     def try_login() -> None:
         username = (username_input.value or '').strip()
         password = password_input.value or ''
@@ -3229,18 +3440,40 @@ def login_page():
         app.storage.user['is_admin'] = bool(user_info.get('is_admin', False))
         ui.navigate.to('/')
 
-    with ui.card().classes('absolute-center w-96 p-6 bg-zinc-900 border border-zinc-800 rounded-xl shadow-lg gap-4'):
-        with ui.column().classes('w-full items-center gap-1'):
-            ui.label('🎓 Slide Narrator').classes('text-h5 font-bold text-white')
-            ui.label('サインインして続行してください').classes('text-xs text-zinc-400')
+    with ui.column().classes('w-full min-h-screen items-center justify-center p-4 bg-gradient-to-br from-slate-950 via-zinc-900 to-slate-950'):
+        # カード幅を max-w-sm から max-w-md に変更
+        with ui.card().classes('w-full max-w-md p-6 bg-zinc-900/90 backdrop-blur border border-zinc-800 rounded-2xl shadow-2xl gap-4'):
 
-        username_input = ui.input('ユーザー名').props('outlined dense autofocus').classes('w-full')
-        password_input = ui.input('パスワード', password=True, password_toggle_button=True).props('outlined dense').classes('w-full')
-        password_input.on('keydown.enter', try_login)
-        username_input.on('keydown.enter', try_login)
+            # ヘッダー部
+            with ui.column().classes('w-full items-center gap-1'):
+                with ui.row().classes('items-center justify-center gap-4 mb-1'):
+                    ui.icon('picture_as_pdf', size='48px').classes('text-red-400')
+                    ui.icon('arrow_forward', size='28px').classes('text-zinc-400')
+                    ui.icon('movie', size='48px').classes('text-blue-400')
+                ui.label('Slide Narrator').classes('text-xl font-bold tracking-tight text-white')
+                # whitespace-nowrap を追加（1行維持）
+                ui.label('Turn your PDF presentation slides into narrated lecture videos with AI.').classes('text-xs text-zinc-400 whitespace-nowrap')
+            # サーバーが実行中だった場合のみ静的にスピナーを表示
+            if is_busy:
+                with ui.row().classes('w-full items-center gap-2.5 p-2.5 bg-amber-500/10 border border-amber-500/30 rounded-lg'):
+                    ui.spinner(size='sm', color='warning').classes('shrink-0')
+                    with ui.column().classes('grow gap-0 leading-tight'):
+                        ui.label(f'ユーザー{busy_user}が生成処理中です').classes('text-[11px] font-bold text-amber-400')
+                        ui.label('しばらく待ってからお試しください')
 
-        ui.button('ログイン', on_click=try_login).props('color=primary').classes('w-full mt-2')
+            # 入力フィールド
+            with ui.column().classes('w-full gap-3 pt-1'):
+                username_input = ui.input('ユーザー名').props('outlined dense autofocus').classes('w-full')
+                password_input = ui.input('パスワード', password=True, password_toggle_button=True).props('outlined dense').classes('w-full')
+                username_input.on('keydown.enter', try_login)
+                password_input.on('keydown.enter', try_login)
 
+            ui.button('ログイン', on_click=try_login).props('color=primary unelevated').classes('w-full font-semibold mt-1')
+
+            # フッター部
+            with ui.column().classes('w-full items-center gap-0.5 pt-3 border-t border-zinc-800/80'):
+                ui.label('TAKAGO_LAB. 2026').classes('text-[12px] font-mono tracking-widest text-zinc-400')
+                ui.label('Kanazawa Institute of Technology').classes('text-[12px] text-zinc-600')
 
 ui.run(
     title='Slide Narrator',
