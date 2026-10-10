@@ -15,7 +15,6 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
-
 from __future__ import annotations
 
 import asyncio
@@ -27,12 +26,10 @@ from pathlib import Path
 import secrets
 import shutil
 import signal
-import subprocess
 import sys
 import time
-from typing import Any, Callable
+from typing import Any
 
-import httpx
 import pymupdf as fitz
 import yaml
 from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
@@ -64,22 +61,25 @@ from tts_filter import (
 # ----------------------------------------------------------------------
 
 class ExecutionLockManager:
-    """複数のユーザーやセッションが同時に重い推論・レンダリング処理を行わないよう排他制御するマネージャ"""
+    """複数ユーザーやセッションが同時に重い推論・レンダリング処理を行わないよう排他制御するマネージャ"""
+
     def __init__(self) -> None:
         self.lock = asyncio.Lock()
         self.current_user: str | None = None
         self.task_name: str | None = None
+        self.owner_app: Any | None = None
 
     def is_locked(self) -> bool:
         return self.lock.locked()
 
-    async def acquire(self, username: str, task_name: str) -> bool:
+    async def acquire(self, username: str, task_name: str, owner_app: Any | None = None) -> bool:
         """ロックを即座に試行取得。他が実行中の場合はキューイングせず即座に False を返す"""
         if self.lock.locked():
             return False
         await self.lock.acquire()
         self.current_user = username
         self.task_name = task_name
+        self.owner_app = owner_app
         return True
 
     def release(self) -> None:
@@ -87,6 +87,7 @@ class ExecutionLockManager:
             self.lock.release()
         self.current_user = None
         self.task_name = None
+        self.owner_app = None
 
 
 GLOBAL_EXECUTION_LOCK = ExecutionLockManager()
@@ -113,7 +114,6 @@ def verify_password(password: str, stored_hash: str) -> bool:
     if not stored_hash:
         return False
 
-    # 平文からハッシュ化への過渡期互換（平文で完全一致すればOK）
     if not stored_hash.startswith('pbkdf2:sha256:'):
         return password == stored_hash
 
@@ -138,7 +138,7 @@ def verify_password(password: str, stored_hash: str) -> bool:
 
 USERS_FILE = Path('users.yaml')
 
-DEFAULT_USERS_DATA = {
+DEFAULT_USERS_DATA: dict[str, Any] = {
     'users': {
         'admin': {
             'password': hash_password('secret'),
@@ -178,7 +178,6 @@ def save_users(data: dict[str, Any]) -> None:
 
 def is_user_within_allowed_period(user_info: dict[str, Any]) -> tuple[bool, str]:
     """利用可能日時制限の判定 (YYYY-MM-DD HH:MM または YYYY-MM-DD 形式)"""
-    # 管理者権限を持つユーザーは事故防止のため常に利用可能とする
     if user_info.get('is_admin', False):
         return True, ''
 
@@ -215,7 +214,7 @@ def is_user_within_allowed_period(user_info: dict[str, Any]) -> tuple[bool, str]
 
 
 # ----------------------------------------------------------------------
-# Configuration / filesystem helpers
+# Configuration / Workspace / Job Tracking
 # ----------------------------------------------------------------------
 
 CONFIG_PATH = Path('config.yaml')
@@ -225,11 +224,68 @@ BASE_UPLOAD_DIR.mkdir(exist_ok=True)
 
 
 def get_user_workspace(username: str) -> Path:
-    """ユーザーごとの個別作業ディレクトリ"""
     safe_name = "".join(c for c in username if c.isalnum() or c in ('_', '-')).strip() or 'unknown'
     p = BASE_UPLOAD_DIR / safe_name
     p.mkdir(parents=True, exist_ok=True)
     return p
+
+
+def user_last_project_file(username: str) -> Path:
+    return get_user_workspace(username) / '.last_project.json'
+
+
+def user_job_status_file(username: str) -> Path:
+    return get_user_workspace(username) / '.job_status.json'
+
+
+def user_job_log_file(username: str) -> Path:
+    return get_user_workspace(username) / '.job_log.txt'
+
+
+def append_user_job_log(username: str, line: str) -> None:
+    # ログ本文は状態管理用JSONとは別ファイルに保存する．
+    path = user_job_log_file(username)
+    stamp = datetime.now().isoformat(timespec='seconds')
+    with path.open('a', encoding='utf-8') as f:
+        f.write(f'[{stamp}] {line}\n')
+
+
+def read_user_job_log(username: str, max_lines: int = 2000) -> str:
+    try:
+        lines = user_job_log_file(username).read_text(encoding='utf-8').splitlines()
+    except OSError:
+        return ''
+    return '\n'.join(lines[-max_lines:])
+
+
+def clear_user_job_log(username: str) -> None:
+    user_job_log_file(username).write_text('', encoding='utf-8')
+
+
+def read_user_job_status(username: str) -> dict[str, Any]:
+    path = user_job_status_file(username)
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def write_user_job_status(username: str, **updates: Any) -> None:
+    path = user_job_status_file(username)
+    status = read_user_job_status(username)
+    status.update(updates)
+    status['updated_at'] = datetime.now().isoformat(timespec='seconds')
+    temp = path.with_name(path.name + '.tmp')
+    temp.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding='utf-8')
+    temp.replace(path)
+
+
+def safe_notify(*args: Any, **kwargs: Any) -> None:
+    try:
+        ui.notify(*args, **kwargs)
+    except Exception:
+        pass
 
 
 def load_config(path: Path) -> dict:
@@ -243,11 +299,6 @@ def save_config(path: Path, cfg: dict) -> None:
         yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False),
         encoding='utf-8',
     )
-
-
-def run_command(args: list[str]) -> tuple[int, str]:
-    p = subprocess.run(args, capture_output=True, text=True)
-    return p.returncode, p.stdout + '\n' + p.stderr
 
 
 # ----------------------------------------------------------------------
@@ -341,10 +392,10 @@ def draw_block_preview(img_path: Path, blocks: list[dict]) -> Image.Image:
     draw = ImageDraw.Draw(im)
 
     color_map = {
-        'image_subpart': ('#ef4444', 3),  # 赤色: VLM検出要素（太枠）
-        'image': ('#f59e0b', 2),          # 橙色: 画像領域全体
-        'text': ('#3b82f6', 2),           # 青色: 通常テキスト
-        'code_line': ('#06b6d4', 2),      # 水色: コード行
+        'image_subpart': ('#ef4444', 3),
+        'image': ('#f59e0b', 2),
+        'text': ('#3b82f6', 2),
+        'code_line': ('#06b6d4', 2),
     }
 
     for b in blocks:
@@ -361,11 +412,10 @@ def draw_block_preview(img_path: Path, blocks: list[dict]) -> Image.Image:
 
 
 def format_page_ranges(pages: list[int]) -> str:
-    """整数のリストから '1-5,7,9-10' のような範囲文字列を生成します．"""
     if not pages:
         return ''
     sorted_pages = sorted(set(pages))
-    ranges = []
+    ranges: list[str] = []
     start = sorted_pages[0]
     prev = sorted_pages[0]
 
@@ -373,23 +423,15 @@ def format_page_ranges(pages: list[int]) -> str:
         if p == prev + 1:
             prev = p
         else:
-            if start == prev:
-                ranges.append(str(start))
-            else:
-                ranges.append(f'{start}-{prev}')
+            ranges.append(str(start) if start == prev else f'{start}-{prev}')
             start = p
             prev = p
 
-    if start == prev:
-        ranges.append(str(start))
-    else:
-        ranges.append(f'{start}-{prev}')
-
+    ranges.append(str(start) if start == prev else f'{start}-{prev}')
     return ','.join(ranges)
 
 
 def file_url(path: Path) -> str:
-    """ファイルの最終更新日時(mtime)をクエリに付与し、ブラウザキャッシュを安全に回避します．"""
     rel = path.resolve().relative_to(Path.cwd().resolve()).as_posix()
     ts = int(path.stat().st_mtime) if path.exists() else int(time.time())
     return f'/files/{rel}?t={ts}'
@@ -426,21 +468,34 @@ async def download_file(path: str):
 
 
 # ----------------------------------------------------------------------
-# Application state
+# Application Main Controller
 # ----------------------------------------------------------------------
+
+STAGE_DEFINITIONS = [
+    ('explain', '① ナレーション原稿の生成', '① ナレーション原稿を作成中…'),
+    ('align', '② 翻訳，字幕生成，ポインタ配置', '② 翻訳と字幕，ポインタ配置を決定中…'),
+    ('tts', '③ ナレーション音声の作成', '③ ナレーション音声を作成中…'),
+    ('video', '④ ナレーションビデオの作成', '④ ナレーションビデオを作成中…'),
+]
+
+ORDERED_STAGES = [key for key, _, _ in STAGE_DEFINITIONS]
+
 
 class SlideNarratorApp:
     def __init__(self, username: str) -> None:
         self.username = username
         self.cfg = load_config(CONFIG_PATH)
+        user_info = load_users().get('users', {}).get(username, {})
+        self.read_only = not is_user_within_allowed_period(user_info)[0]
 
-        # ユーザー固有の作業ディレクトリ
+        # ワークスペース
         self.user_dir = get_user_workspace(self.username)
         self.test_audio_dir = self.user_dir / 'test_audio'
         self.test_audio_dir.mkdir(exist_ok=True)
         self.test_vlm_dir = self.user_dir / 'test_vlm'
         self.test_vlm_dir.mkdir(exist_ok=True)
 
+        # プロジェクト状態
         self.pdf: Path | None = None
         self.paths: ProjectPaths | None = None
         self.images: list[Path] = []
@@ -451,18 +506,21 @@ class SlideNarratorApp:
         self.slide_visual_modes: dict[str, str] = {}
         self.force_run = False
         self.edit_page: int | None = None
-        self.log = ''
         self.processing = False
-
         self._selected_pages: set[int] = set()
 
+        # プロセス・非同期タスク管理
         self.current_process: asyncio.subprocess.Process | None = None
         self.current_task: asyncio.Task | None = None
         self.cancellation_requested = False
+        self._loaded_log_text: str | None = None
+        self._restore_started = False
+        self._refresh_debounce_task: asyncio.Task | None = None
 
-        self.uploader = None
-        self.active_count_label = None
+        # UI ウィジェット参照
+        self.job_status_label = None
         self.history_log_widget = None
+        self._history_log_entries: list[Any] = []
         self.tabs = None
         self.gallery = None
         self.simple_edit_container = None
@@ -471,12 +529,293 @@ class SlideNarratorApp:
         self.final_video_container = None
         self.settings_container = None
         self.user_manage_container = None
+        self.uploader = None
+        self.active_count_label = None
         self.mode_select = None
         self.lang_select = None
         self.default_vlm_switch = None
         self.pages_input = None
         self.force_checkbox = None
-        self.pipeline_buttons = []
+        self.pipeline_buttons: list[Any] = []
+        self.stage_widgets: dict[str, dict[str, Any]] = {}
+        self.pipeline_busy_row = None
+        self.pipeline_busy_notice = None
+        self.main_action_buttons: list[Any] = []
+
+    # --- 認証・権限制御 ---
+
+    def write_access_allowed(self, notify: bool = True) -> bool:
+        user_info = load_users().get('users', {}).get(self.username, {})
+        allowed, reason = is_user_within_allowed_period(user_info)
+        self.read_only = not allowed
+        if not allowed and notify:
+            safe_notify(f'現在は閲覧モードです．編集・生成はできません．{reason}', type='warning')
+        return allowed
+
+    @staticmethod
+    def set_button_enabled_visual(button: Any, enabled: bool) -> None:
+        try:
+            if enabled:
+                button.enable()
+                button.classes(remove='opacity-40 grayscale')
+            else:
+                button.disable()
+                button.classes(add='opacity-40 grayscale')
+        except Exception:
+            pass
+
+    def register_main_action_button(self, button: Any) -> Any:
+        self.main_action_buttons.append(button)
+        self.set_button_enabled_visual(button, not (GLOBAL_EXECUTION_LOCK.is_locked() or self.read_only))
+        return button
+
+    # --- ジョブ状態・ログ管理 ---
+
+    def update_job_status(self, state: str | None = None, **updates: Any) -> dict[str, Any]:
+        if state is not None:
+            updates['state'] = state
+        write_user_job_status(self.username, **updates)
+        status = read_user_job_status(self.username)
+        if self.job_status_label is not None:
+            try:
+                self.job_status_label.text = self.format_job_status(status)
+            except Exception:
+                pass
+        return status
+
+    @staticmethod
+    def _log_line_classes(line: str) -> str:
+        """ログの内容に応じて，表示用の文字色を返す．"""
+        upper = line.upper()
+        if '[ERROR]' in upper or 'TRACEBACK' in upper or 'EXCEPTION' in upper or '失敗' in line or 'エラー' in line:
+            color = 'text-red-400'
+        elif '[CANCEL]' in upper or '中断' in line:
+            color = 'text-orange-300'
+        elif '[WARN' in upper or 'WARNING' in upper or '警告' in line:
+            color = 'text-amber-300'
+        elif '[REGEN]' in upper or '[ALIGN]' in upper or '[TTS]' in upper:
+            color = 'text-cyan-300'
+        elif '[PROGRESS]' in upper or '完了' in line or '終了' in line:
+            color = 'text-emerald-300'
+        elif '開始' in line or '[INFO]' in upper:
+            color = 'text-sky-300'
+        else:
+            color = 'text-zinc-300'
+        return f'font-mono text-xs whitespace-pre-wrap break-words leading-5 {color}'
+
+    def _append_history_log_line(self, line: str) -> None:
+        if self.history_log_widget is None:
+            return
+        with self.history_log_widget:
+            entry = ui.label(line).classes(self._log_line_classes(line))
+        self._history_log_entries.append(entry)
+        # ui.log(max_lines=2000) と同様に，表示は直近2000行に制限する．
+        while len(self._history_log_entries) > 2000:
+            old_entry = self._history_log_entries.pop(0)
+            try:
+                old_entry.delete()
+            except Exception:
+                pass
+
+    def append_job_log(self, line: str) -> None:
+        line = str(line)
+        append_user_job_log(self.username, line)
+        if self.history_log_widget is not None:
+            try:
+                self._append_history_log_line(f'[{datetime.now().strftime("%H:%M:%S")}] {line}')
+            except Exception:
+                pass
+        self._loaded_log_text = None
+
+    def clear_job_log(self) -> None:
+        clear_user_job_log(self.username)
+        self._loaded_log_text = ''
+        self._history_log_entries.clear()
+        if self.history_log_widget is not None:
+            try:
+                self.history_log_widget.clear()
+            except Exception:
+                pass
+
+    def refresh_history_log(self) -> None:
+        if self.history_log_widget is None:
+            return
+        contents = read_user_job_log(self.username)
+        if contents == self._loaded_log_text:
+            return
+        try:
+            self.history_log_widget.clear()
+            self._history_log_entries.clear()
+            for line in contents.splitlines()[-2000:]:
+                self._append_history_log_line(line)
+            self._loaded_log_text = contents
+        except Exception:
+            pass
+
+    @staticmethod
+    def format_job_status(status: dict[str, Any]) -> str:
+        state = status.get('state', 'idle')
+        labels = {
+            'running': '生成処理中',
+            'completed': '直近の生成処理は完了',
+            'failed': '直近の生成処理は失敗',
+            'cancelled': '直近の生成処理は中断',
+            'idle': '生成処理の履歴はありません',
+        }
+        label = labels.get(state, str(state))
+        detail = status.get('message') or status.get('stage') or ''
+        updated = status.get('updated_at') or ''
+        suffix = f' — {detail}' if detail else ''
+        progress = status.get('progress')
+        if state == 'running' and isinstance(progress, (int, float)):
+            suffix += f'（進捗 {max(0, min(100, int(progress * 100)))}％）'
+        page = status.get('current_page')
+        if state == 'running' and page is not None:
+            suffix += f'［スライド {page}］'
+        return f'処理状態：{label}{suffix}' + (f'（{updated}）' if updated else '')
+
+    @staticmethod
+    def stage_button_key(stage: str | None) -> str | None:
+        stage = str(stage or '')
+        if any(word in stage for word in ('ナレーション原稿', 'ナレーション再生成', 'explain')):
+            return 'explain'
+        if any(word in stage for word in ('字幕', 'ポインタ', '翻訳', 'align')):
+            return 'align'
+        if any(word in stage for word in ('音声合成', '音声を作成', '音声', 'tts')):
+            return 'tts'
+        if any(word in stage for word in ('動画', 'ビデオ', 'video', 'concat')):
+            return 'video'
+        return None
+
+    def get_active_stage_key(self, status: dict[str, Any]) -> str | None:
+        stage_key = self.stage_button_key(status.get('stage'))
+        if not stage_key and GLOBAL_EXECUTION_LOCK.is_locked():
+            task_name = GLOBAL_EXECUTION_LOCK.task_name or ''
+            if task_name.startswith('パイプライン (') and task_name.endswith(')'):
+                stage_key = self.stage_button_key(task_name[len('パイプライン ('):-1])
+            else:
+                stage_key = self.stage_button_key(task_name)
+        return stage_key
+
+    def refresh_job_status(self) -> None:
+        """ポーリング時に画面上のボタン・進捗バー群を同期"""
+        allowed_now = self.write_access_allowed(notify=False)
+        if self.read_only != (not allowed_now):
+            safe_notify('利用可能時間が変わったため，画面を更新します．', type='info')
+            try:
+                ui.navigate.reload()
+            except Exception:
+                pass
+            return
+
+        globally_busy = GLOBAL_EXECUTION_LOCK.is_locked()
+        owner_name = GLOBAL_EXECUTION_LOCK.current_user or '' if globally_busy else ''
+
+        if globally_busy:
+            status = read_user_job_status(owner_name) if owner_name else {}
+            # ロック解放直前の completed/failed/cancelled 状態を running に上書きしない．
+            status = {**status, 'stage': status.get('stage') or GLOBAL_EXECUTION_LOCK.task_name or '処理中'}
+        else:
+            status = read_user_job_status(self.username)
+            if status.get('state') == 'running':
+                status = {**status, 'state': 'failed', 'message': '実行中状態を確認できません（サーバ再起動等の可能性があります）'}
+
+        active_key = self.get_active_stage_key(status)
+        owner_is_self = globally_busy and owner_name == self.username
+
+        # 他ユーザー実行中の警告表示
+        if self.pipeline_busy_row is not None and self.pipeline_busy_notice is not None:
+            try:
+                if globally_busy and not owner_is_self:
+                    self.pipeline_busy_notice.text = f'他のユーザ（{owner_name or "xxxx"}）が処理中です．'
+                    self.pipeline_busy_row.classes(remove='hidden')
+                else:
+                    self.pipeline_busy_row.classes(add='hidden')
+            except Exception:
+                pass
+
+        owner_app = GLOBAL_EXECUTION_LOCK.owner_app if globally_busy else None
+        cancel_pending = bool(owner_app and owner_app.cancellation_requested)
+        completed_stages = status.get('completed_stages', [])
+
+        # 現在実行中ステージのインデックス（通過済み判定用）
+        active_idx = ORDERED_STAGES.index(active_key) if (active_key in ORDERED_STAGES) else -1
+
+        # ステージボタンおよびプログレスバー群の更新
+        for key, w in self.stage_widgets.items():
+            btn = w['button']
+            box = w['box']
+            p_label = w['label']
+            p_spinner = w['spinner']
+            p_bar = w['bar']
+            p_indet = w['indeterminate']
+
+            try:
+                btn.classes(remove='animate-pulse rotate-infinite')
+                btn.props(remove='icon')
+
+                key_idx = ORDERED_STAGES.index(key) if key in ORDERED_STAGES else -1
+
+                if owner_is_self and status.get('state') == 'running' and key == active_key:
+                    # 【現在実行中のステージ】
+                    btn.props('color=primary')
+                    box.classes(remove='hidden')
+                    p_spinner.classes(remove='hidden')
+
+                    progress = status.get('progress')
+                    slide_num = status.get('current_page')
+                    cur_idx = status.get('current_index')
+                    tot_cnt = status.get('total_count')
+
+                    if slide_num is not None:
+                        if cur_idx and tot_cnt:
+                            slide_prefix = f'スライド {slide_num} ({cur_idx}/{tot_cnt})'
+                        else:
+                            slide_prefix = f'スライド {slide_num}'
+                    else:
+                        slide_prefix = '処理中…'
+
+                    if isinstance(progress, (int, float)):
+                        percent = max(0, min(100, int(progress * 100)))
+                        p_label.text = f'{slide_prefix} : {percent}％'
+                        p_bar.value = percent / 100.0
+                        p_bar.classes(remove='hidden')
+                        p_indet.classes(add='hidden')
+                    else:
+                        p_label.text = slide_prefix
+                        p_bar.classes(add='hidden')
+                        p_indet.classes(remove='hidden')
+
+                    self.set_button_enabled_visual(btn, not cancel_pending)
+
+                elif owner_is_self and (key in completed_stages or (active_idx >= 0 and key_idx < active_idx)):
+                    # 【通過・完了済みの前工程ステージ】
+                    box.classes(remove='hidden')
+                    p_spinner.classes(add='hidden')
+                    p_label.text = '完了 (100％)'
+                    p_bar.value = 1.0
+                    p_bar.classes(remove='hidden')
+                    p_indet.classes(add='hidden')
+                    self.set_button_enabled_visual(btn, False)
+
+                else:
+                    box.classes(add='hidden')
+                    p_spinner.classes(add='hidden')
+                    if globally_busy:
+                        btn.props('color=grey-6')
+                        self.set_button_enabled_visual(btn, False)
+                    else:
+                        btn.props('color=primary')
+                        self.set_button_enabled_visual(btn, not self.read_only)
+            except Exception:
+                pass
+
+        for button in self.main_action_buttons:
+            self.set_button_enabled_visual(button, not (globally_busy or self.read_only))
+
+        self.refresh_history_log()
+
+    # --- プロジェクト / スライド選択管理 ---
 
     @property
     def total_slides(self) -> int:
@@ -513,8 +852,11 @@ class SlideNarratorApp:
             else:
                 self._selected_pages = set(range(1, self.total_slides + 1))
 
-        self._on_pages_updated(sync_input=(self.pages_input and self.pages_input.value != self.pages_spec),
-                               save=save_and_refresh, refresh=save_and_refresh)
+        self._on_pages_updated(
+            sync_input=(self.pages_input and self.pages_input.value != self.pages_spec),
+            save=save_and_refresh,
+            refresh=save_and_refresh,
+        )
 
     def _on_pages_updated(self, sync_input: bool = True, save: bool = True, refresh: bool = True) -> None:
         if self.edit_page not in self._selected_pages:
@@ -541,7 +883,32 @@ class SlideNarratorApp:
         await self.refresh_editor()
         await self.refresh_slide_videos()
 
+    def debounce_refresh_views(self, stages: tuple[str, ...]) -> None:
+        """進捗更新時に過剰な再描画タスクが連続生成されるのを防止"""
+        if self._refresh_debounce_task and not self._refresh_debounce_task.done():
+            return
+
+        async def _runner():
+            await asyncio.sleep(0.1)
+            if any(s in ('explain', 'align') for s in stages):
+                await self.refresh_simple_editor()
+                await self.refresh_editor()
+            if any(s in ('tts', 'video') for s in stages):
+                await self.refresh_slide_videos()
+                await self.refresh_editor()
+
+        self._refresh_debounce_task = asyncio.create_task(_runner())
+
+    def refresh_output_views_on_tab_change(self) -> None:
+        asyncio.create_task(self.refresh_slide_videos())
+        asyncio.create_task(self.refresh_final_video())
+        self.refresh_history_log()
+
+    # --- PDF 読み込み & 復元 ---
+
     async def load_pdf(self, e) -> None:
+        if not self.write_access_allowed():
+            return
         filename = Path(e.file.name).name
         target_pdf = self.user_dir / filename
         target_paths = ProjectPaths(target_pdf)
@@ -549,9 +916,15 @@ class SlideNarratorApp:
         temp_pdf = self.user_dir / f".upload_{int(time.time())}_{filename}"
         await e.file.save(temp_pdf)
 
-        has_existing_project = target_paths.root.exists() or target_pdf.exists()
+        has_existing = target_paths.root.exists() or target_pdf.exists()
 
         async def finalize_loading(delete_existing: bool) -> None:
+            if not self.write_access_allowed():
+                try:
+                    temp_pdf.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                return
             if delete_existing:
                 if target_paths.root.exists():
                     shutil.rmtree(target_paths.root, ignore_errors=True)
@@ -560,9 +933,14 @@ class SlideNarratorApp:
                 ui.notify(f'既存のプロジェクトデータを削除しました: {target_paths.root.name}', type='info')
 
             temp_pdf.replace(target_pdf)
-
             self.pdf = target_pdf
             self.paths = target_paths
+
+            last_file = user_last_project_file(self.username)
+            temp_last = last_file.with_name(last_file.name + '.tmp')
+            temp_last.write_text(json.dumps({'pdf': target_pdf.name}, ensure_ascii=False), encoding='utf-8')
+            temp_last.replace(last_file)
+
             self.proj_cfg = load_project_json(self.paths.root)
             self.mode_code = self.proj_cfg.get('mode') or self.cfg.get('mode', 'lecture')
             self.lang_code = self.proj_cfg.get('language') or self.cfg.get('language', 'ja')
@@ -582,7 +960,7 @@ class SlideNarratorApp:
             await self.refresh_all()
             ui.notify(f'プレゼンテーションを読み込みました: {target_pdf.name}', type='positive')
 
-        if has_existing_project:
+        if has_existing:
             with ui.dialog() as dialog, ui.card().classes('p-5 gap-4 max-w-md'):
                 dialog.props('persistent')
                 with ui.row().classes('items-center gap-2 text-warning'):
@@ -610,6 +988,47 @@ class SlideNarratorApp:
         else:
             await finalize_loading(delete_existing=False)
 
+    async def restore_last_project(self) -> None:
+        if self._restore_started:
+            return
+        self._restore_started = True
+        try:
+            marker = user_last_project_file(self.username)
+            try:
+                data = json.loads(marker.read_text(encoding='utf-8'))
+                filename = Path(str(data.get('pdf', ''))).name
+            except (OSError, ValueError, TypeError):
+                existing_pdfs = list(self.user_dir.glob('*.pdf'))
+                if not existing_pdfs:
+                    return
+                filename = max(existing_pdfs, key=lambda item: item.stat().st_mtime).name
+                marker.write_text(json.dumps({'pdf': filename}, ensure_ascii=False), encoding='utf-8')
+
+            if not filename or filename in ('.', '..'):
+                return
+            target_pdf = (self.user_dir / filename).resolve()
+            if target_pdf.parent != self.user_dir.resolve() or not target_pdf.is_file():
+                return
+
+            self.pdf = target_pdf
+            self.paths = ProjectPaths(target_pdf)
+            self.proj_cfg = load_project_json(self.paths.root)
+            self.mode_code = self.proj_cfg.get('mode') or self.cfg.get('mode', 'lecture')
+            self.lang_code = self.proj_cfg.get('language') or self.cfg.get('language', 'ja')
+            saved_vmode = self.proj_cfg.get('visual_mode') or self.cfg.get('visual_mode', 'vlm')
+            self.default_use_vlm = saved_vmode in ('vlm', 'auto', True, 'true')
+            self.slide_visual_modes = self.proj_cfg.get('slide_visual_modes', {})
+            self.images = await run.io_bound(ensure_page_images, self.paths, int(self.cfg.get('pdf', {}).get('dpi', 120)))
+            self.apply_pages_spec(self.proj_cfg.get('pages', ''), save_and_refresh=False)
+            self.refresh_project_widgets()
+            await self.refresh_all()
+            if self.read_only:
+                safe_notify('利用可能時間外のため，閲覧モードでプロジェクトを復元しました．', type='info')
+        except FileNotFoundError:
+            return
+        except Exception as exc:
+            safe_notify(f'前回のプロジェクトを復元できませんでした: {exc}', type='warning')
+
     def refresh_project_widgets(self) -> None:
         if not self.pdf:
             return
@@ -625,7 +1044,7 @@ class SlideNarratorApp:
             self.active_count_label.text = f'対象スライド: {len(self._selected_pages)} / {self.total_slides} スライド'
 
     def save_project_settings(self) -> None:
-        if not self.paths:
+        if not self.write_access_allowed() or not self.paths:
             return
         self.proj_cfg.update({
             'mode': self.mode_code,
@@ -638,6 +1057,8 @@ class SlideNarratorApp:
         save_project_json(self.paths.root, self.proj_cfg)
 
     def toggle_slide_active(self, page_num: int, active: bool) -> None:
+        if not self.write_access_allowed():
+            return
         if active:
             self._selected_pages.add(page_num)
         else:
@@ -645,125 +1066,83 @@ class SlideNarratorApp:
         self._on_pages_updated(sync_input=True, save=True, refresh=True)
 
     def select_all_slides(self) -> None:
-        if self.pdf and self.total_slides > 0:
-            self._selected_pages = set(range(1, self.total_slides + 1))
-        else:
-            self._selected_pages = set()
+        if not self.write_access_allowed():
+            return
+        self._selected_pages = set(range(1, self.total_slides + 1)) if (self.pdf and self.total_slides > 0) else set()
         self._on_pages_updated(sync_input=True, save=True, refresh=True)
 
     def clear_all_slides(self) -> None:
+        if not self.write_access_allowed():
+            return
         self._selected_pages = set()
         self._on_pages_updated(sync_input=True, save=True, refresh=True)
 
-    def open_processing_dialog(self, initial_title: str) -> tuple[ui.dialog, Callable[[str, float | None, str | None, int | None], None], Callable[[str], None]]:
-        dialog = ui.dialog()
-        dialog.props('persistent')
-        self.cancellation_requested = False
+    # --- パイプライン実行・中断制御 ---
 
-        with dialog, ui.card().classes('items-center p-6 gap-3 min-w-[620px] max-w-[760px]'):
-            title_label = ui.label(initial_title).classes('text-base font-bold text-center text-zinc-100')
-
-            slide_preview_row = ui.row().classes('w-full items-end justify-center gap-3 py-2')
-            with slide_preview_row:
-                with ui.column().classes('items-center w-28 opacity-45'):
-                    prev_img_box = ui.column().classes('w-28 aspect-video items-center justify-center')
-                    with prev_img_box:
-                        prev_image = ui.image('').props('fit=contain').classes('w-full h-full rounded').style('display: none')
-                        prev_placeholder = ui.label('-').classes('text-xs text-zinc-500')
-
-                with ui.column().classes('items-center w-52 scale-105 transition-all'):
-                    curr_img_box = ui.column().classes('w-52 aspect-video items-center justify-center')
-                    with curr_img_box:
-                        curr_image = ui.image('').props('fit=contain').classes('w-full h-full rounded').style('display: none')
-                        curr_placeholder = ui.label('スライド待機中').classes('text-xs text-zinc-400')
-
-                with ui.column().classes('items-center w-28 opacity-45'):
-                    next_img_box = ui.column().classes('w-28 aspect-video items-center justify-center')
-                    with next_img_box:
-                        next_image = ui.image('').props('fit=contain').classes('w-full h-full rounded').style('display: none')
-                        next_placeholder = ui.label('-').classes('text-xs text-zinc-500')
-
-            status_label = ui.label('準備中…').classes('text-sm text-zinc-400 text-center')
-
-            with ui.row().classes('w-full items-center gap-2'):
-                progress_bar = ui.linear_progress(value=0.0, show_value=False).props('rounded size=14px').classes('grow')
-
-            with ui.expansion('詳細ログを表示', icon='terminal').classes('w-full border border-zinc-700 rounded-lg text-xs mt-1'):
-                dialog_log = ui.log(max_lines=300).classes('w-full h-40 font-mono text-xs bg-zinc-900 text-zinc-300 p-2')
-
-            ui.spinner(size='md')
-
-            with ui.row().classes('w-full justify-center pt-2'):
-                ui.button('処理を中断', on_click=self.request_cancel, color='negative').props('text-color=white')
-
+    def confirm_cancel(self) -> None:
+        with ui.dialog() as dialog, ui.card().classes('min-w-[320px]'):
+            ui.label('生成処理を中断しますか？').classes('text-lg font-bold')
+            ui.label('実行中の処理によっては，現在の工程が戻るまで停止に時間がかかります．').classes('text-sm text-zinc-400')
+            with ui.row().classes('w-full justify-end'):
+                ui.button('戻る', on_click=dialog.close).props('flat')
+                ui.button('中断を要求', color='negative', on_click=lambda: (dialog.close(), asyncio.create_task(self.request_cancel())))
         dialog.open()
 
-        def update_slide_preview(current_page: int | None) -> None:
-            if not self.paths or current_page is None:
-                return
-            pages_list = self.active_pages if self.active_pages else list(range(1, self.total_slides + 1))
-            if current_page not in pages_list:
-                return
-
-            idx = pages_list.index(current_page)
-            prev_p = pages_list[idx - 1] if idx > 0 else None
-            next_p = pages_list[idx + 1] if idx + 1 < len(pages_list) else None
-
-            def set_preview(image_widget, placeholder, page: int | None) -> None:
-                if page is not None:
-                    image_path = self.paths.page_image(page)
-                    if image_path.exists():
-                        image_widget.set_source(file_url(image_path))
-                        image_widget.style('display: block')
-                        placeholder.style('display: none')
-                        return
-                image_widget.style('display: none')
-                placeholder.style('display: block')
-
-            set_preview(prev_image, prev_placeholder, prev_p)
-            set_preview(curr_image, curr_placeholder, current_page)
-            set_preview(next_image, next_placeholder, next_p)
-
-        def update_status(text: str, frac: float | None = None, title: str | None = None, current_page: int | None = None) -> None:
-            if title is not None:
-                title_label.text = title
-            status_label.text = text
-            if frac is None:
-                progress_bar.value = 0.0
-            else:
-                clamped = max(0.0, min(1.0, float(frac)))
-                progress_bar.value = clamped
-
-            if current_page is not None:
-                update_slide_preview(current_page)
-
-        return dialog, update_status, dialog_log.push
-
     async def request_cancel(self) -> None:
-        if self.cancellation_requested:
+        if not GLOBAL_EXECUTION_LOCK.is_locked():
+            safe_notify('中断できる処理はありません．', type='info')
             return
-        self.cancellation_requested = True
-        ui.notify('処理の中断を要求しました．停止中…', type='warning')
+        if GLOBAL_EXECUTION_LOCK.current_user != self.username:
+            safe_notify('他のユーザーの処理は中断できません．', type='warning')
+            return
 
-        if self.current_process and self.current_process.returncode is None:
+        owner = GLOBAL_EXECUTION_LOCK.owner_app
+        if owner is None:
+            safe_notify('処理の管理情報が見つからないため，中断要求を送れません．', type='negative')
+            return
+        if owner.cancellation_requested:
+            safe_notify('すでに中断要求を受け付けています．', type='warning')
+            return
+
+        owner.cancellation_requested = True
+        owner.update_job_status(
+            'running', cancellation_requested=True,
+            message='中断要求を受け付けました．実行中の処理を停止しています',
+        )
+        owner.append_job_log('[CANCEL] 中断要求を受け付けました')
+
+        proc = owner.current_process
+        if proc is not None and proc.returncode is None:
             try:
-                if sys.platform != "win32":
-                    os.killpg(os.getpgid(self.current_process.pid), signal.SIGTERM)
+                if sys.platform != 'win32':
+                    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 else:
-                    self.current_process.terminate()
-            except Exception:
-                try:
-                    self.current_process.terminate()
-                except Exception:
-                    pass
-
-        if self.current_task and not self.current_task.done():
-            self.current_task.cancel()
+                    proc.terminate()
+                safe_notify('中断要求を送信しました．停止を確認しています…', type='warning')
+            except ProcessLookupError:
+                safe_notify('処理はすでに停止しています．状態を確認しています…', type='info')
+            except Exception as exc:
+                owner.append_job_log(f'[CANCEL] プロセス停止要求に失敗: {exc}')
+                safe_notify(f'プロセス停止要求に失敗しました: {exc}', type='negative')
+        else:
+            safe_notify('中断要求を受け付けました．実行中の処理が戻り次第，中断します．', type='warning')
 
     def set_processing(self, value: bool) -> None:
         self.processing = value
-        for button in self.pipeline_buttons:
-            button.disable() if value else button.enable()
+        status = read_user_job_status(self.username)
+        if value:
+            status = {**status, 'state': 'running'}
+        elif not GLOBAL_EXECUTION_LOCK.is_locked():
+            status = {**status, 'state': 'idle'}
+        active_key = self.get_active_stage_key(status)
+        for key, button in zip(('explain', 'align', 'tts', 'video'), self.pipeline_buttons):
+            try:
+                if value:
+                    self.set_button_enabled_visual(button, key == active_key and not self.cancellation_requested)
+                else:
+                    self.set_button_enabled_visual(button, not self.read_only)
+            except Exception:
+                pass
 
     def base_args(self) -> list[str]:
         args = [
@@ -778,24 +1157,33 @@ class SlideNarratorApp:
             args.extend(['--pages', spec])
         return args
 
-    async def pipeline(self, stage: str, initial_title: str) -> None:
-        if not self.pdf:
-            ui.notify('先にプレゼンテーションPDFを選択してください．', type='warning')
+    async def handle_pipeline_button(self, stage: str, initial_title: str) -> None:
+        if GLOBAL_EXECUTION_LOCK.is_locked():
+            if GLOBAL_EXECUTION_LOCK.current_user == self.username:
+                owner = GLOBAL_EXECUTION_LOCK.owner_app
+                status = read_user_job_status(self.username)
+                active_key = self.get_active_stage_key(status)
+                if active_key == stage and owner is not None:
+                    self.confirm_cancel()
+                else:
+                    safe_notify('現在の処理が終わるまで，ほかの工程は開始できません．', type='info')
+            else:
+                safe_notify(f'{GLOBAL_EXECUTION_LOCK.current_user or "別のユーザー"} が処理中です．完了までお待ちください．', type='warning')
             return
-        if not self.active_pages:
-            ui.notify('処理対象となるスライドが1枚も選択されていません．', type='warning')
-            return
-        if self.processing:
-            ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
-            return
+        await self.pipeline(stage, initial_title)
 
-        # --- 実行すべき一連のステージを算出 ---
-        # 依存関係:
-        #   explain: 前提なし
-        #   align  : 要 explain
-        #   tts    : 要 explain
-        #   video  : 要 explain -> align -> tts
-        stages_to_run: list[str] = []
+    async def pipeline(self, stage: str, initial_title: str) -> None:
+        if not self.write_access_allowed():
+            return
+        if self.current_task and not self.current_task.done():
+            safe_notify('このユーザーの生成処理はすでに実行中です．', type='warning')
+            return
+        self.current_task = asyncio.create_task(self._pipeline_worker(stage, initial_title))
+
+    def _determine_starting_stage(self, target_stage: str) -> str:
+        """必要な前工程の成果物を確認し，実行開始ステージを決定する．"""
+        assert self.paths is not None
+        stage_index = ORDERED_STAGES.index(target_stage)
 
         has_missing_explain = any(
             not self.paths.explanation(p).exists()
@@ -811,62 +1199,106 @@ class SlideNarratorApp:
             for p in self.active_pages
         )
 
-        if stage == 'explain':
-            stages_to_run = ['explain']
-        elif stage == 'align':
-            if has_missing_explain:
-                stages_to_run.append('explain')
-            stages_to_run.append('align')
-        elif stage == 'tts':
-            if has_missing_explain:
-                stages_to_run.append('explain')
-            stages_to_run.append('tts')
-        elif stage == 'video':
-            if has_missing_explain:
-                stages_to_run.append('explain')
-            if has_missing_align:
-                stages_to_run.append('align')
-            if has_missing_tts:
-                stages_to_run.append('tts')
-            stages_to_run.append('video')
+        # 選択された工程までに必要な最初の未完了工程から開始する．
+        if stage_index >= ORDERED_STAGES.index('explain') and has_missing_explain:
+            return 'explain'
+        if stage_index >= ORDERED_STAGES.index('align') and has_missing_align:
+            return 'align'
+        if stage_index >= ORDERED_STAGES.index('tts') and has_missing_tts:
+            return 'tts'
+        return target_stage
 
-        # 排他制御チェック
-        lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"パイプライン ({stage})")
-        if not lock_acquired:
-            msg = f'他のユーザー（{GLOBAL_EXECUTION_LOCK.current_user or "誰か"}）が「{GLOBAL_EXECUTION_LOCK.task_name or "処理"}」を実行中です．完了するまでリクエストは受け付けられません．'
-            ui.notify(msg, type='negative', duration=5)
+    async def _pipeline_worker(self, stage: str, initial_title: str) -> None:
+        if not self.pdf:
+            safe_notify('先にプレゼンテーションPDFを選択してください．', type='warning')
+            self.current_task = None
+            return
+        if not self.active_pages:
+            safe_notify('処理対象となるスライドが1枚も選択されていません．', type='warning')
+            self.current_task = None
+            return
+        if self.processing:
+            safe_notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
+            self.current_task = None
             return
 
+        from_stage = self._determine_starting_stage(stage)
+        # 「キャッシュを破棄してやり直す」が指定された場合は，選択工程までを最初から作り直す．
+        if self.force_run:
+            from_stage = 'explain'
+        first_idx = ORDERED_STAGES.index(from_stage)
+        target_idx = ORDERED_STAGES.index(stage)
+        stages_to_run = ORDERED_STAGES[first_idx:target_idx + 1]
+
+        lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"パイプライン ({stage})", self)
+        if not lock_acquired:
+            msg = f'他のユーザー（{GLOBAL_EXECUTION_LOCK.current_user or "誰か"}）が「{GLOBAL_EXECUTION_LOCK.task_name or "処理"}」を実行中です．完了するまでリクエストは受け付けられません．'
+            safe_notify(msg, type='negative', duration=5)
+            self.current_task = None
+            return
+
+        self.cancellation_requested = False
+        self.current_task = asyncio.current_task()
         self.save_project_settings()
-        dialog, update_status, push_log = self.open_processing_dialog(initial_title)
+        total_active_slides = len(self.active_pages)
+        completed_stages: list[str] = []
+        all_logs: list[str] = []
+        current_phase = from_stage
+        succeeded = True
+        cancelled = False
+
+        self.update_job_status(
+            'running',
+            stage=from_stage,
+            message='処理を開始します…',
+            completed_stages=[],
+            cancellation_requested=False,
+            progress=0.0,
+            current_page=self.active_pages[0],
+            current_index=1,
+            total_count=total_active_slides,
+            started_at=datetime.now().isoformat(timespec='seconds'),
+        )
         self.set_processing(True)
 
-        phase_titles = {
-            'explain': '① ナレーション原稿を作成中…',
-            'align': '② 字幕・ポインタを解析中…',
-            'tts': '③ 音声を合成中…',
-            'video': '④ スライド動画をレンダリング中…',
-            'concat': '④ 完成動画を結合・生成中…',
-        }
-
-        total_active_slides = len(self.active_pages)
         env = os.environ.copy()
         env['PYTHONUNBUFFERED'] = '1'
 
         try:
-            for current_stage in stages_to_run:
+            for run_index, run_stage in enumerate(stages_to_run):
                 if self.cancellation_requested:
+                    cancelled = True
+                    succeeded = False
+                    self.update_job_status(
+                        'cancelled', stage=run_stage, completed_stages=list(completed_stages),
+                        message='処理を中断しました', cancellation_requested=False,
+                        finished_at=datetime.now().isoformat(timespec='seconds'),
+                    )
                     break
 
-                stage_title = phase_titles.get(current_stage, f'{current_stage} を実行中…')
-                update_status(f'{stage_title} を開始します…', 0.0, title=stage_title, current_page=self.active_pages[0])
-                push_log(f'=== ステージ開始: {current_stage} ===')
-                await asyncio.sleep(0.05)
+                current_phase = run_stage
+                stage_title = next((label for key, label, _ in STAGE_DEFINITIONS if key == run_stage), run_stage)
+                stage_message = next((msg for key, _, msg in STAGE_DEFINITIONS if key == run_stage), '処理中…')
+                self.update_job_status(
+                    'running', stage=run_stage, completed_stages=list(completed_stages),
+                    message=stage_message, progress=0.0,
+                    current_page=self.active_pages[0], current_index=1,
+                    total_count=total_active_slides,
+                )
+                self.append_job_log(f'=== {stage_title} 開始: --from {run_stage} ===')
 
-                cmd = [sys.executable, '-u', 'slide_lecture.py', str(self.pdf), '--from', current_stage, *self.base_args()]
+                args = self.base_args()
+                # --force は最初の起動時だけ付ける．後続の起動で先行成果物を消したり，
+                # 先行工程を繰り返し強制生成したりしないようにする．
+                if run_index > 0 and '--force' in args:
+                    args.remove('--force')
+                cmd = [
+                    sys.executable, '-u', 'slide_lecture.py',
+                    str(self.pdf), '--from', run_stage, *args,
+                ]
 
-                create_group_kwargs = {}
-                if sys.platform != "win32":
+                create_group_kwargs: dict[str, Any] = {}
+                if sys.platform != 'win32':
                     create_group_kwargs['preexec_fn'] = os.setsid
 
                 proc = await asyncio.create_subprocess_exec(
@@ -878,16 +1310,13 @@ class SlideNarratorApp:
                 )
                 self.current_process = proc
 
-                full_logs: list[str] = []
                 while True:
                     line_bytes = await proc.stdout.readline()
                     if not line_bytes:
                         break
                     line = line_bytes.decode('utf-8', errors='replace').rstrip()
-                    full_logs.append(line)
-                    push_log(line)
-                    if self.history_log_widget:
-                        self.history_log_widget.push(line)
+                    all_logs.append(line)
+                    self.append_job_log(line)
 
                     if line.startswith('[PROGRESS]'):
                         try:
@@ -898,51 +1327,129 @@ class SlideNarratorApp:
                             p_num = p_data.get('page')
                             msg = p_data.get('message', '')
 
-                            title = phase_titles.get(phase, stage_title)
-                            weight = 0.9 if phase == 'video' else 1.0
-                            frac = (cur / max(1, tot)) * weight if tot else 0.5
-                            if phase == 'concat':
-                                frac = 0.95
-                                status_label_text = msg or '完成動画を結合・生成中…'
-                            elif p_num is not None:
-                                status_label_text = f'スライド {p_num}（{cur}/{tot}）'
-                            else:
-                                status_label_text = msg or f'スライド {cur}（{cur}/{tot}）'
+                            # slide_lecture.py は --from align/tts/video でもキャッシュ確認のため
+                            # 先行工程を通るため，今回実行している工程の進捗だけを表示する．
+                            effective_phase = 'video' if phase == 'concat' else phase
+                            if effective_phase != run_stage:
+                                continue
 
-                            update_status(status_label_text, frac, title=title, current_page=p_num)
+                            frac = 1.0 if phase == 'concat' else (cur / max(1, tot) if tot else 0.0)
+                            self.update_job_status(
+                                'running', stage=run_stage,
+                                completed_stages=list(completed_stages),
+                                message=msg or ('完成動画を結合・生成中…' if phase == 'concat' else stage_message),
+                                progress=max(0.0, min(1.0, float(frac))),
+                                current_page=p_num,
+                                current_index=cur,
+                                total_count=tot,
+                            )
+                            self.debounce_refresh_views((run_stage,))
                         except Exception:
+                            # 進捗行の解析失敗で本体処理やログ保存を止めない．
                             pass
 
                     await asyncio.sleep(0.01)
 
                 rc = await proc.wait()
-                self.log = '\n'.join(full_logs)
+                self.current_process = None
 
                 if rc != 0:
-                    ui.notify(f'ステージ {current_stage} が終了コード {rc} で失敗したため処理を中断しました．', type='negative')
+                    succeeded = False
+                    if self.cancellation_requested:
+                        cancelled = True
+                        self.update_job_status(
+                            'cancelled', stage=run_stage,
+                            completed_stages=list(completed_stages),
+                            message='処理を中断しました', cancellation_requested=False,
+                            finished_at=datetime.now().isoformat(timespec='seconds'),
+                        )
+                    else:
+                        self.update_job_status(
+                            'failed', stage=run_stage,
+                            completed_stages=list(completed_stages),
+                            message=f'工程「{stage_title}」が終了コード {rc} で失敗しました',
+                            finished_at=datetime.now().isoformat(timespec='seconds'),
+                        )
+                        safe_notify(f'工程「{stage_title}」が終了コード {rc} で失敗したため，後続処理を中断しました．', type='negative')
                     break
 
-            if self.cancellation_requested:
-                ui.notify('処理を中断しました．完了したスライドは保存されています．', type='warning')
-            elif rc == 0:
-                update_status('全工程が完了しました！', 1.0, title='処理が完了しました')
-                await asyncio.sleep(0.5)
-                ui.notify('要求された処理がすべて完了しました．', type='positive')
+                if self.cancellation_requested:
+                    succeeded = False
+                    cancelled = True
+                    self.update_job_status(
+                        'cancelled', stage=run_stage,
+                        completed_stages=list(completed_stages),
+                        message='処理を中断しました', cancellation_requested=False,
+                        finished_at=datetime.now().isoformat(timespec='seconds'),
+                    )
+                    break
 
-            await self.refresh_all()
+                if run_stage not in completed_stages:
+                    completed_stages.append(run_stage)
+                self.update_job_status(
+                    'running', stage=run_stage,
+                    completed_stages=list(completed_stages),
+                    message=f'{stage_title} 完了', progress=1.0,
+                    current_page=self.active_pages[-1],
+                    current_index=total_active_slides,
+                    total_count=total_active_slides,
+                )
+                self.debounce_refresh_views((run_stage,))
+
+
+            if succeeded and not cancelled:
+                self.update_job_status(
+                    'completed', stage=stage,
+                    completed_stages=list(completed_stages),
+                    message='要求された処理がすべて完了しました',
+                    progress=1.0,
+                    cancellation_requested=False,
+                    finished_at=datetime.now().isoformat(timespec='seconds'),
+                )
+                safe_notify('要求された処理がすべて完了しました．', type='positive')
+            elif cancelled:
+                saved = read_user_job_status(self.username)
+                if saved.get('state') != 'cancelled':
+                    self.update_job_status(
+                        'cancelled', completed_stages=list(completed_stages),
+                        message='処理を中断しました', cancellation_requested=False,
+                        finished_at=datetime.now().isoformat(timespec='seconds'),
+                    )
+
+            try:
+                await self.refresh_all()
+            except Exception:
+                pass
 
         except asyncio.CancelledError:
-            ui.notify('処理がキャンセルされました．', type='warning')
+            self.update_job_status(
+                'cancelled', stage=current_phase, completed_stages=list(completed_stages),
+                message='処理がキャンセルされました', cancellation_requested=False,
+                finished_at=datetime.now().isoformat(timespec='seconds'),
+            )
+            safe_notify('処理がキャンセルされました．', type='warning')
         except Exception as exc:
-            self.log = str(exc)
-            if self.history_log_widget:
-                self.history_log_widget.push(str(exc))
-            ui.notify(f'処理に失敗しました: {exc}', type='negative')
+            self.append_job_log(f'[ERROR] {exc}')
+            self.update_job_status(
+                'failed', stage=current_phase, completed_stages=list(completed_stages),
+                message=str(exc)[:240], finished_at=datetime.now().isoformat(timespec='seconds'),
+            )
+            safe_notify(f'処理に失敗しました: {exc}', type='negative')
         finally:
+            if self.cancellation_requested:
+                saved = read_user_job_status(self.username)
+                if saved.get('state') == 'running':
+                    self.update_job_status(
+                        'cancelled', completed_stages=list(completed_stages),
+                        cancellation_requested=False, message='処理を中断しました',
+                        finished_at=datetime.now().isoformat(timespec='seconds'),
+                    )
             self.current_process = None
             self.set_processing(False)
             GLOBAL_EXECUTION_LOCK.release()
-            dialog.close()
+            self.current_task = None
+
+    # --- 個別スライド操作（原稿再生成・アライメント・TTS） ---
 
     def alignment_data(self, page: int) -> tuple[dict, list[dict], list[dict]]:
         if not self.paths:
@@ -969,33 +1476,42 @@ class SlideNarratorApp:
             if i + 1 < len(self.active_pages):
                 await self.select_edit_page(self.active_pages[i + 1])
 
-    async def regenerate_narration(self, page: int, text_area) -> None:
-        if not self.pdf or not self.paths:
+    async def regenerate_narration(self, page: int, text_area: Any) -> None:
+        if not self.write_access_allowed():
+            return
+        if self.current_task and not self.current_task.done():
+            safe_notify('このユーザーの処理はすでに実行中です．', type='warning')
+            return
+        self.current_task = asyncio.create_task(self._regenerate_narration_worker(page, text_area))
+
+    async def _regenerate_narration_worker(self, page: int, text_area: Any) -> None:
+        if not self.write_access_allowed() or not self.pdf or not self.paths:
             return
         if self.processing:
-            ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
+            safe_notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
             return
 
-        lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"スライド {page} ナレーション再生成")
+        lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"スライド {page} ナレーション再生成", self)
         if not lock_acquired:
-            msg = f'他のユーザー（{GLOBAL_EXECUTION_LOCK.current_user or "誰か"}）が「{GLOBAL_EXECUTION_LOCK.task_name or "処理"}」を実行中です．完了するまでリクエストは受け付けられません．'
-            ui.notify(msg, type='negative', duration=5)
+            safe_notify(f'他のユーザーが処理を実行中です．完了するまでお待ちください．', type='negative', duration=5)
             return
 
-        dialog, update_status, push_log = self.open_processing_dialog(f'スライド {page} のナレーションをLLMで再作成中…')
+        self.update_job_status(
+            'running',
+            stage='explain',
+            message=f'スライド {page} の原稿を作成中…',
+            progress=0.2,
+            current_page=page,
+            started_at=datetime.now().isoformat(timespec='seconds'),
+        )
+        self.append_job_log(f'[REGEN] スライド {page} ナレーション再生成開始')
         self.set_processing(True)
         self.current_task = asyncio.current_task()
         try:
-            update_status('全体概要と前後文脈をロード中…', 0.2, current_page=page)
-            push_log(f'[REGEN] スライド {page} ナレーション再生成開始')
-            await asyncio.sleep(0.01)
-
             cfg = self.cfg
             client = await run.io_bound(make_client, cfg['llm'])
 
-            update_status(f'LLMでスライド {page} の解説文を推論中…', 0.7, current_page=page)
-            push_log(f'[REGEN] LLM推論中...')
-            await asyncio.sleep(0.01)
+            self.update_job_status('running', stage='explain', message=f'スライド {page} をLLM推論中…', progress=0.6, current_page=page)
 
             new_narration = await run.io_bound(
                 generate_single_explanation,
@@ -1012,59 +1528,70 @@ class SlideNarratorApp:
 
             if not self.cancellation_requested:
                 self.paths.cleanup_downstream(page, include_alignment=True)
-                text_area.value = new_narration.strip()
-                update_status('完了しました！', 1.0, current_page=page)
-                push_log(f'[REGEN] 完了: 新しいナレーションを保存しました')
-                await asyncio.sleep(0.3)
-                ui.notify('ナレーションを再生成しました（古い字幕・音声・動画を初期化しました）．', type='positive')
-                await self.refresh_simple_editor()
-                await self.refresh_editor()
+                try:
+                    text_area.value = new_narration.strip()
+                except Exception:
+                    pass
+                self.update_job_status('completed', message=f'スライド {page} のナレーション再生成完了', progress=1.0, finished_at=datetime.now().isoformat(timespec='seconds'))
+                self.append_job_log(f'[REGEN] 完了: 新しいナレーションを保存しました')
+                safe_notify('ナレーションを再生成しました（古い字幕・音声・動画を初期化しました）．', type='positive')
+                try:
+                    await self.refresh_simple_editor()
+                    await self.refresh_editor()
+                except Exception:
+                    pass
         except asyncio.CancelledError:
-            ui.notify('ナレーション再生成を中断しました．', type='warning')
+            self.update_job_status('cancelled', message='ナレーション再生成を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
+            safe_notify('ナレーション再生成を中断しました．', type='warning')
         except Exception as exc:
-            ui.notify(f'再生成に失敗しました: {exc}', type='negative')
+            self.update_job_status('failed', message=str(exc)[:240], finished_at=datetime.now().isoformat(timespec='seconds'))
+            safe_notify(f'再生成に失敗しました: {exc}', type='negative')
         finally:
+            if self.cancellation_requested:
+                saved = read_user_job_status(self.username)
+                if saved.get('state') == 'running':
+                    self.update_job_status('cancelled', cancellation_requested=False, message='処理を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
             self.current_task = None
             self.set_processing(False)
             GLOBAL_EXECUTION_LOCK.release()
-            dialog.close()
 
     async def save_and_realign(self, page: int, text: str, page_use_vlm: bool | None = None) -> None:
-        if not self.pdf or not self.paths:
+        if not self.write_access_allowed():
             return
+        if self.current_task and not self.current_task.done():
+            safe_notify('このユーザーの処理はすでに実行中です．', type='warning')
+            return
+        self.current_task = asyncio.create_task(self._save_and_realign_worker(page, text, page_use_vlm))
+
+    async def _save_and_realign_worker(self, page: int, text: str, page_use_vlm: bool | None = None) -> None:
+        if not self.write_access_allowed() or not self.pdf or not self.paths:
+            return
+
         ep = self.paths.explanation(page)
         ep.parent.mkdir(parents=True, exist_ok=True)
         temp_ep = ep.with_name(f".{ep.name}.tmp")
         temp_ep.write_text(text.rstrip() + '\n', encoding='utf-8')
         temp_ep.replace(ep)
 
-        # ページ固有のVLM併用フラグを保存
-        if page_use_vlm is not None:
-            mode_str = 'vlm' if page_use_vlm else 'pdf'
-        else:
-            mode_str = self.slide_visual_modes.get(str(page), 'vlm' if self.default_use_vlm else 'pdf')
-
+        mode_str = ('vlm' if page_use_vlm else 'pdf') if page_use_vlm is not None else self.slide_visual_modes.get(str(page), 'vlm' if self.default_use_vlm else 'pdf')
         self.slide_visual_modes[str(page)] = mode_str
         self.save_project_settings()
 
         if self.processing:
-            ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
+            safe_notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
             return
 
-        lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"スライド {page} 字幕・ポインタ再解析")
+        lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"スライド {page} 字幕・ポインタ再解析", self)
         if not lock_acquired:
-            msg = f'他のユーザー（{GLOBAL_EXECUTION_LOCK.current_user or "誰か"}）が「{GLOBAL_EXECUTION_LOCK.task_name or "処理"}」を実行中です．完了するまでリクエストは受け付けられません．'
-            ui.notify(msg, type='negative', duration=5)
+            safe_notify(f'他のユーザーが処理を実行中です．完了するまでお待ちください．', type='negative', duration=5)
             return
 
         mode_label = "VLM併用" if mode_str == 'vlm' else "PDF基準"
-        dialog, update_status, push_log = self.open_processing_dialog(f'スライド {page} の要素抽出と視線誘導を再解析中…')
+        self.update_job_status('running', stage='align', message=f'スライド {page} 解析中（{mode_label}）', progress=0.3, current_page=page, started_at=datetime.now().isoformat(timespec='seconds'))
+        self.append_job_log(f'[ALIGN] スライド {page} の要素抽出 ({mode_label}) と視線誘導を再計算中...')
         self.set_processing(True)
         self.current_task = asyncio.current_task()
         try:
-            update_status(f'要素抽出（{mode_label}）と対訳・視線誘導を再計算中…', 0.5, current_page=page)
-            push_log(f'[ALIGN] スライド {page} の要素抽出 ({mode_label}) と視線誘導を再計算中...')
-            await asyncio.sleep(0.01)
             client = await run.io_bound(make_client, self.cfg['llm'])
             dpi = int(self.cfg.get('pdf', {}).get('dpi', 150))
             data = await run.io_bound(
@@ -1082,24 +1609,31 @@ class SlideNarratorApp:
                 temp_alp.replace(alp)
 
                 self.paths.cleanup_downstream(page, include_alignment=False)
-                update_status('完了しました！', 1.0, current_page=page)
-                push_log(f'[ALIGN] 完了: 字幕・ポインタアライメントを保存しました')
-                await asyncio.sleep(0.3)
-                ui.notify(f'スライド {page} の字幕とポインタを再生成しました（{mode_label}）．', type='positive')
-                await self.refresh_simple_editor()
-                await self.refresh_editor()
+                self.update_job_status('completed', message=f'スライド {page} の解析完了', progress=1.0, finished_at=datetime.now().isoformat(timespec='seconds'))
+                self.append_job_log(f'[ALIGN] 完了: 字幕・ポインタアライメントを保存しました')
+                safe_notify(f'スライド {page} の字幕とポインタを再生成しました（{mode_label}）．', type='positive')
+                try:
+                    await self.refresh_simple_editor()
+                    await self.refresh_editor()
+                except Exception:
+                    pass
         except asyncio.CancelledError:
-            ui.notify('解析を中断しました．', type='warning')
+            self.update_job_status('cancelled', message='字幕・ポインタ再解析を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
+            safe_notify('解析を中断しました．', type='warning')
         except Exception as exc:
-            ui.notify(f'再解析に失敗しました: {exc}', type='negative')
+            self.update_job_status('failed', message=str(exc)[:240], finished_at=datetime.now().isoformat(timespec='seconds'))
+            safe_notify(f'再解析に失敗しました: {exc}', type='negative')
         finally:
+            if self.cancellation_requested:
+                saved = read_user_job_status(self.username)
+                if saved.get('state') == 'running':
+                    self.update_job_status('cancelled', cancellation_requested=False, message='処理を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
             self.current_task = None
             self.set_processing(False)
             GLOBAL_EXECUTION_LOCK.release()
-            dialog.close()
 
     async def save_alignment(self, page: int, rows: list[dict], align_data: dict) -> None:
-        if not self.paths:
+        if not self.write_access_allowed() or not self.paths:
             return
         alp = self.paths.alignment(page)
         align_data['alignments'] = rows
@@ -1114,30 +1648,34 @@ class SlideNarratorApp:
         await self.refresh_editor()
 
     async def generate_slide_tts(self, page: int) -> None:
-        if not self.pdf or not self.paths:
+        if not self.write_access_allowed():
+            return
+        if self.current_task and not self.current_task.done():
+            safe_notify('このユーザーの処理はすでに実行中です．', type='warning')
+            return
+        self.current_task = asyncio.create_task(self._generate_slide_tts_worker(page))
+
+    async def _generate_slide_tts_worker(self, page: int) -> None:
+        if not self.write_access_allowed() or not self.pdf or not self.paths:
             return
         txt_path = self.paths.explanation(page)
         if not txt_path.exists() or not txt_path.read_text(encoding='utf-8').strip():
-            ui.notify(f'スライド {page} のナレーション原稿がありません．先に作成してください．', type='warning')
+            safe_notify(f'スライド {page} のナレーション原稿がありません．先に作成してください．', type='warning')
             return
         if self.processing:
-            ui.notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
+            safe_notify('別の処理が実行中です．処理が終わるまでお待ちください．', type='warning')
             return
 
-        lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"スライド {page} 音声合成")
+        lock_acquired = await GLOBAL_EXECUTION_LOCK.acquire(self.username, f"スライド {page} 音声合成", self)
         if not lock_acquired:
-            msg = f'他のユーザー（{GLOBAL_EXECUTION_LOCK.current_user or "誰か"}）が「{GLOBAL_EXECUTION_LOCK.task_name or "処理"}」を実行中です．完了するまでリクエストは受け付けられません．'
-            ui.notify(msg, type='negative', duration=5)
+            safe_notify(f'他のユーザーが処理を実行中です．完了するまでお待ちください．', type='negative', duration=5)
             return
 
-        dialog, update_status, push_log = self.open_processing_dialog(f'スライド {page} の音声を合成中 ({self.lang_code})…')
+        self.update_job_status('running', stage='tts', message=f'スライド {page} 音声合成中…', progress=0.4, current_page=page, started_at=datetime.now().isoformat(timespec='seconds'))
+        self.append_job_log(f'[TTS] スライド {page} の音声合成を開始 (lang={self.lang_code})')
         self.set_processing(True)
         self.current_task = asyncio.current_task()
         try:
-            update_status(f'音声合成中…', 0.5, current_page=page)
-            push_log(f'[TTS] スライド {page} の音声合成を開始 (lang={self.lang_code})')
-            await asyncio.sleep(0.01)
-
             tts_all = self.cfg.get('tts', {})
             tts_cfg = tts_all.get(self.lang_code, tts_all)
             out_mp3 = self.paths.audio(page)
@@ -1157,21 +1695,30 @@ class SlideNarratorApp:
                     if f.exists():
                         f.unlink()
 
-                update_status('完了しました！', 1.0, current_page=page)
-                push_log(f'[TTS] スライド {page} の音声を保存しました: {out_mp3.name}')
-                await asyncio.sleep(0.3)
-                ui.notify(f'スライド {page} の音声を合成しました．', type='positive')
-                await self.refresh_editor()
-                await self.refresh_slide_videos()
+                self.update_job_status('completed', message=f'スライド {page} の音声合成完了', progress=1.0, finished_at=datetime.now().isoformat(timespec='seconds'))
+                self.append_job_log(f'[TTS] スライド {page} の音声を保存しました: {out_mp3.name}')
+                safe_notify(f'スライド {page} の音声を合成しました．', type='positive')
+                try:
+                    await self.refresh_editor()
+                    await self.refresh_slide_videos()
+                except Exception:
+                    pass
         except asyncio.CancelledError:
-            ui.notify('音声合成を中断しました．', type='warning')
+            self.update_job_status('cancelled', message='音声合成を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
+            safe_notify('音声合成を中断しました．', type='warning')
         except Exception as exc:
-            ui.notify(f'音声合成に失敗しました: {exc}', type='negative')
+            self.update_job_status('failed', message=str(exc)[:240], finished_at=datetime.now().isoformat(timespec='seconds'))
+            safe_notify(f'音声合成に失敗しました: {exc}', type='negative')
         finally:
+            if self.cancellation_requested:
+                saved = read_user_job_status(self.username)
+                if saved.get('state') == 'running':
+                    self.update_job_status('cancelled', cancellation_requested=False, message='処理を中断しました', finished_at=datetime.now().isoformat(timespec='seconds'))
             self.current_task = None
             self.set_processing(False)
             GLOBAL_EXECUTION_LOCK.release()
-            dialog.close()
+
+    # --- UI レンダリング: スライドデッキ / エディタ / ギャラリー ---
 
     async def refresh_gallery(self) -> None:
         if not self.gallery:
@@ -1180,34 +1727,41 @@ class SlideNarratorApp:
         if not self.images:
             self.gallery.add(ui.label('プレゼンテーションPDFを選択してください．'))
             return
+
         with self.gallery:
             with ui.row().classes('w-full items-center justify-between pb-2'):
-                ui.label(f'全 {self.total_slides} スライド（カードをクリックまたはチェックボックスで対象を切り替えられます）').classes('text-sm text-gray-500 dark:text-gray-400')
-                with ui.row().classes('gap-2'):
-                    ui.button('全スライドを選択', on_click=self.select_all_slides).props('dense outline size=sm')
-                    ui.button('すべて解除', on_click=self.clear_all_slides).props('dense outline size=sm color=negative')
+                desc = f'全 {self.total_slides} スライド' + ('（閲覧モード）' if self.read_only else '（カードをクリックまたはチェックボックスで対象を切り替えられます）')
+                ui.label(desc).classes('text-sm text-gray-500 dark:text-gray-400')
+                if not self.read_only:
+                    with ui.row().classes('gap-2'):
+                        self.register_main_action_button(ui.button('全スライドを選択', on_click=self.select_all_slides).props('dense outline size=sm'))
+                        self.register_main_action_button(ui.button('すべて解除', on_click=self.clear_all_slides).props('dense outline size=sm color=negative'))
 
             with ui.grid(columns=5).classes('w-full gap-4'):
                 for n, img in enumerate(self.images, 1):
                     is_active = n in self._selected_pages
-                    card_classes = 'w-full cursor-pointer transition-all border p-3 rounded-lg gap-2 bg-zinc-800 border-zinc-700 shadow-sm '
-                    img_classes = 'w-full rounded shadow-sm'
-
+                    card_cls = 'w-full cursor-pointer transition-all border p-3 rounded-lg gap-2 bg-zinc-800 border-zinc-700 shadow-sm '
+                    img_cls = 'w-full rounded shadow-sm'
                     if not is_active:
-                        card_classes += 'opacity-40 hover:border-zinc-600'
-                        img_classes += ' grayscale'
+                        card_cls += 'opacity-40 hover:border-zinc-600'
+                        img_cls += ' grayscale'
+                    if self.read_only:
+                        card_cls = card_cls.replace('cursor-pointer', 'cursor-default')
 
-                    card = ui.card().classes(card_classes)
+                    card = ui.card().classes(card_cls)
                     with card:
-                        card.on('click', lambda _, page=n, cur=is_active: self.toggle_slide_active(page, not cur))
-                        ui.image(file_url(img)).classes(img_classes)
+                        if not self.read_only:
+                            card.on('click', lambda _, page=n, cur=is_active: self.toggle_slide_active(page, not cur))
+                        ui.image(file_url(img)).classes(img_cls)
 
                         with ui.row().classes('w-full items-center justify-between pt-1'):
-                            ui.checkbox(
+                            cb = ui.checkbox(
                                 f'スライド {n}',
                                 value=is_active,
                                 on_change=lambda e, page=n: self.toggle_slide_active(page, e.value),
                             ).props('dense dark color=blue').classes('text-white font-medium text-sm')
+                            if self.read_only:
+                                cb.disable()
 
     async def refresh_simple_editor(self) -> None:
         if not self.simple_edit_container:
@@ -1240,21 +1794,19 @@ class SlideNarratorApp:
                                 ta = ui.textarea(
                                     label=f'ナレーション原稿（スライド {p}）',
                                     value=curr_txt,
-                                ).props('outlined').classes('w-full h-[180px]').style(
-                                    'height: 180px; min-height: 180px;'
-                                )
+                                ).props('outlined').classes('w-full h-[180px]').style('height: 180px; min-height: 180px;')
                                 ta.props('input-style="height: 140px; resize: vertical;"')
 
                                 with ui.row().classes('w-full items-center justify-end gap-3 pt-1'):
-                                    ui.button(
+                                    self.register_main_action_button(ui.button(
                                         '✨ ナレーションを再生成',
                                         on_click=lambda _, page=p, area=ta: self.regenerate_narration(page, area),
-                                    ).props('outline dense')
+                                    ).props('outline dense'))
 
-                                    ui.button(
+                                    self.register_main_action_button(ui.button(
                                         '🔄 保存して字幕・ポインタを再解析',
                                         on_click=lambda _, page=p, area=ta: self.save_and_realign(page, area.value),
-                                    ).props('dense color=primary')
+                                    ).props('dense color=primary'))
 
     async def refresh_editor(self) -> None:
         if not self.edit_container:
@@ -1264,6 +1816,7 @@ class SlideNarratorApp:
             with self.edit_container:
                 ui.label('⚠ 処理対象となるスライドがありません．「スライドデッキ」タブで対象スライドを選択してください．').classes('text-orange-500 dark:text-orange-400')
             return
+
         page = self.edit_page or self.active_pages[0]
         self.edit_page = page
         idx = self.active_pages.index(page)
@@ -1288,7 +1841,6 @@ class SlideNarratorApp:
                     ui.button('◀ 前', on_click=self.prev_edit).props(f'disable={idx == 0} outlined dense')
                     ui.button('次 ▶', on_click=self.next_edit).props(f'disable={idx == len(self.active_pages)-1} outlined dense')
 
-                # スライド個別トグル
                 with ui.row().classes('items-center gap-2 p-1 px-3 bg-zinc-900 border border-zinc-800 rounded-lg'):
                     page_vlm_switch = ui.switch(
                         'VLMを活用してポインタ配置を決定する',
@@ -1324,16 +1876,16 @@ class SlideNarratorApp:
                         ap = self.paths.audio(page)
                         if ap.exists():
                             ui.audio(file_url(ap)).classes('w-full')
-                            ui.button(
+                            self.register_main_action_button(ui.button(
                                 '🔄 このスライドの音声を再生成',
                                 on_click=lambda _, p=page: self.generate_slide_tts(p),
-                            ).props('dense outline size=sm').classes('w-full mt-1')
+                            ).props('dense outline size=sm').classes('w-full mt-1'))
                         else:
                             ui.label('（音声未生成）').classes('text-xs text-zinc-500 py-1')
-                            ui.button(
+                            self.register_main_action_button(ui.button(
                                 '🔊 このスライドの音声を生成',
                                 on_click=lambda _, p=page: self.generate_slide_tts(p),
-                            ).props('dense color=primary size=sm').classes('w-full')
+                            ).props('dense color=primary size=sm').classes('w-full'))
 
                 with ui.column().classes('flex-[3] min-w-0 gap-3'):
                     ui.label('🎯 検出された要素一覧（バッジ対応）').classes('text-xs font-semibold text-zinc-400')
@@ -1358,24 +1910,16 @@ class SlideNarratorApp:
                                     'border border-zinc-800 hover:border-zinc-700 transition-colors'
                                 ):
                                     with ui.row().classes('items-center gap-2 grow'):
-                                        ui.label(f'#{bid}').classes(
-                                            f'text-xs font-bold font-mono px-2 py-0.5 rounded border {style_cls}'
-                                        )
+                                        ui.label(f'#{bid}').classes(f'text-xs font-bold font-mono px-2 py-0.5 rounded border {style_cls}')
                                         ui.label(label).classes('text-xs text-zinc-200 font-medium break-all')
-
                                     ui.badge(type_name).props('outline').classes('text-[10px] text-zinc-400 shrink-0')
 
             with ui.column().classes('w-full gap-3 pt-2'):
                 main_lang = '日本語' if self.lang_code == 'ja' else '英語'
-                text_area = ui.textarea(
-                    f'主言語ナレーション原稿（{main_lang}）',
-                    value=current_text,
-                ).props('outlined').classes('w-full').style('min-height: 180px')
+                text_area = ui.textarea(f'主言語ナレーション原稿（{main_lang}）', value=current_text).props('outlined').classes('w-full').style('min-height: 180px')
                 with ui.row().classes('w-full gap-2'):
-                    ui.button('✨ ナレーションを再生成',
-                              on_click=lambda: self.regenerate_narration(page, text_area)).classes('grow').props('outline')
-                    ui.button('🔄 保存して字幕・ポインタを再解析',
-                              on_click=lambda: self.save_and_realign(page, text_area.value, page_vlm_switch.value)).classes('grow').props('color=primary')
+                    self.register_main_action_button(ui.button('✨ ナレーションを再生成', on_click=lambda: self.regenerate_narration(page, text_area)).classes('grow').props('outline'))
+                    self.register_main_action_button(ui.button('🔄 保存して字幕・ポインタを再解析', on_click=lambda: self.save_and_realign(page, text_area.value, page_vlm_switch.value)).classes('grow').props('color=primary'))
 
                 if alignments:
                     ui.separator()
@@ -1403,16 +1947,16 @@ class SlideNarratorApp:
 
                     async def save_rows() -> None:
                         out = []
-                        for row in rows:
-                            bid = row['_select'].value
-                            tr = row['_trans'].value or ''
+                        for r in rows:
+                            bid = r['_select'].value
+                            tr = r['_trans'].value or ''
                             if self.lang_code == 'ja':
-                                out.append({'sentence': row['sentence'], 'block_id': bid, 'ja_sentence': row['sentence'], 'en_sentence': tr})
+                                out.append({'sentence': r['sentence'], 'block_id': bid, 'ja_sentence': r['sentence'], 'en_sentence': tr})
                             else:
-                                out.append({'sentence': row['sentence'], 'block_id': bid, 'en_sentence': row['sentence'], 'ja_sentence': tr})
+                                out.append({'sentence': r['sentence'], 'block_id': bid, 'en_sentence': r['sentence'], 'ja_sentence': tr})
                         await self.save_alignment(page, out, align_data)
 
-                    ui.button('💾 字幕・ポインタ修正を保存', on_click=save_rows).classes('w-full mt-2')
+                    self.register_main_action_button(ui.button('💾 字幕・ポインタ修正を保存', on_click=save_rows).classes('w-full mt-2'))
 
     async def refresh_slide_videos(self) -> None:
         if not self.slide_video_gallery:
@@ -1447,7 +1991,6 @@ class SlideNarratorApp:
             return
 
         final = self.paths.final_video
-
         with self.final_video_container:
             if final.exists():
                 ui.video(file_url(final)).classes('w-full rounded shadow-md')
@@ -1459,6 +2002,12 @@ class SlideNarratorApp:
                     ).classes('text-primary font-bold text-xs')
             else:
                 ui.label('動画未生成').classes('text-xs text-zinc-500')
+
+    async def refresh_all(self) -> None:
+        await self.refresh_views()
+        await self.refresh_final_video()
+
+    # --- 設定タブ (LLM / TTS / 辞書) ---
 
     def _build_llm_settings(self) -> tuple[ui.input, ui.input, ui.select, ui.number]:
         with ui.card().classes('w-full p-5 bg-zinc-900 border border-zinc-800 rounded-xl gap-4 shadow-sm'):
@@ -1476,9 +2025,8 @@ class SlideNarratorApp:
                 llm_key = ui.input('LLM API Key', value=llm.get('api_key', 'dummy'), password=True, password_toggle_button=True).classes('w-72')
 
             with ui.row().classes('w-full items-center gap-4'):
-                initial_options = [current_model] if current_model else []
                 llm_model_select = ui.select(
-                    options=initial_options,
+                    options=[current_model] if current_model else [],
                     value=current_model,
                     label='LLM Model (選択または直接入力)',
                 ).props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
@@ -1512,14 +2060,10 @@ class SlideNarratorApp:
 
             fetch_btn.on_click(fetch_llm_models)
 
-            # テキスト接続テスト
             with ui.card().classes('w-full p-3 bg-zinc-950 border border-zinc-800 rounded-lg gap-2'):
                 ui.label('🧪 LLM 接続テスト（テキスト応答）').classes('text-xs font-bold text-zinc-300')
                 with ui.row().classes('w-full items-center gap-2'):
-                    llm_test_input = ui.input(
-                        'テストプロンプト',
-                        value='こんにちは！自己紹介を1文でしてください．',
-                    ).props('dense outlined').classes('grow')
+                    llm_test_input = ui.input('テストプロンプト', value='こんにちは！自己紹介を1文でしてください．').props('dense outlined').classes('grow')
                     llm_test_btn = ui.button('💬 テスト送信').props('dense outline')
 
                 llm_test_result = ui.label('').classes('text-xs text-zinc-300 font-mono p-2 bg-zinc-900 border border-zinc-800 rounded min-h-[36px] w-full whitespace-pre-wrap')
@@ -1537,10 +2081,7 @@ class SlideNarratorApp:
                     llm_test_btn.disable()
                     llm_test_result.text = 'LLMにリクエスト中…'
                     try:
-                        test_cfg = {
-                            'base_url': llm_base.value.strip(),
-                            'api_key': (llm_key.value or '').strip() or 'dummy',
-                        }
+                        test_cfg = {'base_url': llm_base.value.strip(), 'api_key': (llm_key.value or '').strip() or 'dummy'}
                         client = await run.io_bound(make_client, test_cfg)
 
                         def call_llm() -> str:
@@ -1564,7 +2105,6 @@ class SlideNarratorApp:
 
                 llm_test_btn.on_click(run_llm_test)
 
-            # --- VLM マルチモーダル接続テスト ---
             with ui.card().classes('w-full p-3 bg-zinc-950 border border-zinc-800 rounded-lg gap-3 mt-2'):
                 with ui.row().classes('items-center justify-between w-full'):
                     ui.label('👁️ VLM 画像認識 & アライメントテスト').classes('text-xs font-bold text-zinc-300')
@@ -1574,12 +2114,7 @@ class SlideNarratorApp:
 
                 with ui.row().classes('w-full items-start gap-4'):
                     with ui.column().classes('w-80 shrink-0 gap-2'):
-                        vlm_uploader = ui.upload(
-                            label='画像をアップロード（何でも可）',
-                            auto_upload=True,
-                            max_files=1,
-                        ).props('accept="image/*" dense').classes('w-full')
-
+                        vlm_uploader = ui.upload(label='画像をアップロード（何でも可）', auto_upload=True, max_files=1).props('accept="image/*" dense').classes('w-full')
                         vlm_run_btn = ui.button('🔍 VLM解析を実行', color='primary').props('dense outline').classes('w-full')
                         vlm_run_btn.disable()
 
@@ -1591,9 +2126,13 @@ class SlideNarratorApp:
                             vlm_run_btn.enable()
                             vlm_preview_container.clear()
                             vlm_blocks_container.clear()
+                            vlm_description_box.text = ''
+                            vlm_status_label.text = '画像を受信しました．自動解析を開始します…'
                             with vlm_preview_container:
                                 ui.image(file_url(saved_path)).classes('w-full rounded border border-zinc-700 shadow-sm')
-                            ui.notify('テスト画像を読み込みました．「VLM解析を実行」を押してください．', type='info')
+                            # アップロード完了後，そのままVLM解析を開始する．
+                            # 手動ボタンは再解析用として残す．
+                            await run_vlm_test()
 
                         vlm_uploader.on_upload(handle_vlm_upload)
 
@@ -1619,10 +2158,7 @@ class SlideNarratorApp:
                     vlm_description_box.text = '解析中…'
 
                     try:
-                        test_cfg = {
-                            'base_url': llm_base.value.strip(),
-                            'api_key': (llm_key.value or '').strip() or 'dummy',
-                        }
+                        test_cfg = {'base_url': llm_base.value.strip(), 'api_key': (llm_key.value or '').strip() or 'dummy'}
                         client = await run.io_bound(make_client, test_cfg)
 
                         prompt = (
@@ -1674,15 +2210,10 @@ class SlideNarratorApp:
 
                         with vlm_preview_container:
                             ui.label('🎯 アライメントプレビュー & 検出要素一覧').classes('text-xs font-bold text-zinc-300 mt-2')
-
                             with ui.row().classes('w-full items-start gap-4'):
-                                ui.image(f'{file_url(preview_path)}&ts={ts}').classes(
-                                    'w-full max-w-xl rounded-lg border border-zinc-700 shadow-md'
-                                )
-
+                                ui.image(f'{file_url(preview_path)}&ts={ts}').classes('w-full max-w-xl rounded-lg border border-zinc-700 shadow-md')
                                 with ui.column().classes('grow min-w-[280px] max-w-md gap-2'):
                                     ui.label('検出された要素一覧（バッジ対応）').classes('text-xs font-semibold text-zinc-400')
-
                                     if not parsed_blocks:
                                         ui.label('（バウンディングボックスは検出されませんでした）').classes('text-xs text-zinc-500 italic')
                                     else:
@@ -1693,16 +2224,10 @@ class SlideNarratorApp:
                                                 btype = b.get('type', 'image_subpart')
                                                 style_cls, type_name = badge_colors.get(btype, badge_colors['image_subpart'])
 
-                                                with ui.row().classes(
-                                                    'w-full items-center justify-between p-2 rounded bg-zinc-900/90 '
-                                                    'border border-zinc-800 hover:border-zinc-700 transition-colors'
-                                                ):
+                                                with ui.row().classes('w-full items-center justify-between p-2 rounded bg-zinc-900/90 border border-zinc-800 hover:border-zinc-700 transition-colors'):
                                                     with ui.row().classes('items-center gap-2 grow'):
-                                                        ui.label(f'#{bid}').classes(
-                                                            f'text-xs font-bold font-mono px-2 py-0.5 rounded border {style_cls}'
-                                                        )
+                                                        ui.label(f'#{bid}').classes(f'text-xs font-bold font-mono px-2 py-0.5 rounded border {style_cls}')
                                                         ui.label(label).classes('text-xs text-zinc-200 font-medium break-all')
-
                                                     ui.badge(type_name).props('outline').classes('text-[10px] text-zinc-400 shrink-0')
 
                         vlm_blocks_container.clear()
@@ -1712,7 +2237,6 @@ class SlideNarratorApp:
                                     ui.code(json.dumps(parsed_blocks, ensure_ascii=False, indent=2), language='json').classes('w-full bg-zinc-950')
 
                         ui.notify('VLM 解析とプレビュー生成が完了しました．', type='positive')
-
                     except Exception as err:
                         vlm_status_label.text = '解析エラーが発生しました．'
                         vlm_description_box.text = f'【エラー】\n{err}'
@@ -1724,345 +2248,141 @@ class SlideNarratorApp:
 
         return llm_base, llm_key, llm_model_select, llm_temp
 
-    @staticmethod
-    def _fetch_voices_from_server(base_url: str, api_key: str) -> list[str]:
-        url_clean = base_url.rstrip('/')
-        candidate_urls = [
-            f"{url_clean}/audio/voices",
-            f"{url_clean}/voices",
-        ]
-        if url_clean.endswith('/v1'):
-            root_url = url_clean[:-3]
-            candidate_urls.extend([
-                f"{root_url}/audio/voices",
-                f"{root_url}/voices",
-            ])
-
-        headers = {'Authorization': f'Bearer {api_key}'} if api_key and api_key != 'dummy' else {}
-
-        with httpx.Client(trust_env=False, verify=False, timeout=8.0) as client:
-            for endpoint in candidate_urls:
-                try:
-                    resp = client.get(endpoint, headers=headers)
-                    if resp.status_code == 200:
-                        data = resp.json()
-                        voices: list[str] = []
-                        if isinstance(data, list):
-                            for item in data:
-                                if isinstance(item, str):
-                                    voices.append(item)
-                                elif isinstance(item, dict):
-                                    v_id = item.get('id') or item.get('voice_id') or item.get('name')
-                                    if v_id:
-                                        voices.append(str(v_id))
-                        elif isinstance(data, dict):
-                            v_list = data.get('voices') or data.get('data') or []
-                            if isinstance(v_list, list):
-                                for item in v_list:
-                                    if isinstance(item, str):
-                                        voices.append(item)
-                                    elif isinstance(item, dict):
-                                        v_id = item.get('id') or item.get('voice_id') or item.get('name')
-                                        if v_id:
-                                            voices.append(str(v_id))
-                        if voices:
-                            return sorted(set(voices))
-                except Exception:
-                    continue
-        return []
-
     def _build_tts_settings(self) -> tuple[tuple[ui.input, ui.input, ui.select, ui.select], tuple[ui.input, ui.input, ui.select, ui.select]]:
         tts = self.cfg.setdefault('tts', {})
         ja = tts.setdefault('ja', {})
         en = tts.setdefault('en', {})
 
-        with ui.card().classes('w-full p-5 bg-zinc-900 border border-zinc-800 rounded-xl gap-4 shadow-sm mt-2'):
-            with ui.row().classes('w-full items-center justify-between border-b border-zinc-800 pb-2'):
-                with ui.row().classes('items-center gap-2'):
-                    ui.label('🇯🇵').classes('text-xl')
-                    ui.label('日本語 TTS 設定 (`config.yaml: tts.ja`)').classes('text-lg font-bold text-zinc-100')
-                ui.label('※互換API未実装のTTSサーバでは一覧取得できません（直接入力可）').classes('text-xs text-zinc-400')
+        def _build_single_tts_card(lang_tag: str, lang_name: str, cfg_data: dict[str, Any], default_text: str, test_filename: str):
+            with ui.card().classes('w-full p-5 bg-zinc-900 border border-zinc-800 rounded-xl gap-4 shadow-sm mt-2'):
+                with ui.row().classes('w-full items-center justify-between border-b border-zinc-800 pb-2'):
+                    with ui.row().classes('items-center gap-2'):
+                        ui.label('🇯🇵' if lang_tag == 'ja' else '🇺🇸').classes('text-xl')
+                        ui.label(f'{lang_name} TTS 設定 (`config.yaml: tts.{lang_tag}`)').classes('text-lg font-bold text-zinc-100')
+                    ui.label('※互換API未実装のTTSサーバでは一覧取得できません（直接入力可）').classes('text-xs text-zinc-400')
 
-            with ui.row().classes('w-full items-center gap-4'):
-                ja_base = ui.input('日本語 Base URL', value=ja.get('base_url', '')).classes('grow')
-                ja_key = ui.input('日本語 API Key', value=ja.get('api_key', 'dummy'), password=True, password_toggle_button=True).classes('w-72')
+                with ui.row().classes('w-full items-center gap-4'):
+                    base_in = ui.input(f'{lang_name} Base URL', value=cfg_data.get('base_url', '')).classes('grow')
+                    key_in = ui.input(f'{lang_name} API Key', value=cfg_data.get('api_key', 'dummy'), password=True, password_toggle_button=True).classes('w-72')
 
-            cur_ja_model = ja.get('model', '')
-            cur_ja_voice = ja.get('voice', '')
+                cur_model = cfg_data.get('model', '')
+                cur_voice = cfg_data.get('voice', '')
 
-            with ui.row().classes('w-full items-center gap-4'):
-                ja_model_select = ui.select(
-                    options=[cur_ja_model] if cur_ja_model else [],
-                    value=cur_ja_model,
-                    label='日本語 Model',
-                ).props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
+                with ui.row().classes('w-full items-center gap-4'):
+                    model_sel = ui.select(options=[cur_model] if cur_model else [], value=cur_model, label=f'{lang_name} Model').props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
+                    m_btn = ui.button('🔄 モデル取得').props('dense outline')
+                    voice_sel = ui.select(options=[cur_voice] if cur_voice else [], value=cur_voice, label=f'{lang_name} Voice / 話者').props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
+                    v_btn = ui.button('🗣 ボイス取得').props('dense outline')
 
-                ja_model_fetch_btn = ui.button('🔄 モデル取得').props('dense outline')
-
-                ja_voice_select = ui.select(
-                    options=[cur_ja_voice] if cur_ja_voice else [],
-                    value=cur_ja_voice,
-                    label='日本語 Voice / 話者',
-                ).props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
-
-                ja_voice_fetch_btn = ui.button('🗣 ボイス取得').props('dense outline')
-
-            async def fetch_ja_models() -> None:
-                base = (ja_base.value or '').strip()
-                key = (ja_key.value or '').strip() or 'dummy'
-                if not base:
-                    ui.notify('先に日本語 TTS Base URL を入力してください．', type='warning')
-                    return
-                ja_model_fetch_btn.disable()
-                try:
-                    client = await run.io_bound(make_client, {'base_url': base, 'api_key': key})
-                    models_resp = await run.io_bound(client.models.list)
-                    model_ids = sorted([m.id for m in models_resp.data])
-                    if not model_ids:
-                        ui.notify('モデルが見つかりませんでした．', type='warning')
+                async def fetch_models():
+                    b = (base_in.value or '').strip()
+                    k = (key_in.value or '').strip() or 'dummy'
+                    if not b:
+                        ui.notify(f'先に {lang_name} TTS Base URL を入力してください．', type='warning')
                         return
-                    ja_model_select.options = model_ids
-                    if ja_model_select.value not in model_ids:
-                        ja_model_select.value = model_ids[0]
-                    ja_model_select.update()
-                    ui.notify(f'{len(model_ids)} 個のモデルを取得しました．', type='positive')
-                except Exception as err:
-                    ui.notify(f'モデル一覧取得に失敗しました（/v1/models 未対応の可能性）: {err}', type='negative')
-                finally:
-                    ja_model_fetch_btn.enable()
-
-            async def fetch_ja_voices() -> None:
-                base = (ja_base.value or '').strip()
-                key = (ja_key.value or '').strip() or 'dummy'
-                if not base:
-                    ui.notify('先に日本語 TTS Base URL を入力してください．', type='warning')
-                    return
-                ja_voice_fetch_btn.disable()
-                try:
-                    voices = await run.io_bound(self._fetch_voices_from_server, base, key)
-                    if not voices:
-                        ui.notify('ボイス一覧を取得できませんでした（一覧API未対応の可能性）．', type='warning')
-                        return
-                    ja_voice_select.options = voices
-                    if ja_voice_select.value not in voices:
-                        ja_voice_select.value = voices[0]
-                    ja_voice_select.update()
-                    ui.notify(f'{len(voices)} 件のボイスを取得しました．', type='positive')
-                except Exception as err:
-                    ui.notify(f'ボイス一覧取得に失敗しました: {err}', type='negative')
-                finally:
-                    ja_voice_fetch_btn.enable()
-
-            ja_model_fetch_btn.on_click(fetch_ja_models)
-            ja_voice_fetch_btn.on_click(fetch_ja_voices)
-
-            with ui.card().classes('w-full p-3 bg-zinc-950 border border-zinc-800 rounded-lg gap-2'):
-                ui.label('🧪 日本語 TTS 接続・音声再生テスト').classes('text-xs font-bold text-zinc-300')
-                with ui.row().classes('w-full items-center gap-2'):
-                    ja_test_text = ui.input(
-                        '読み上げテキスト',
-                        value='こんにちは。日本語の音声合成テストです。正常に聞こえますか？',
-                    ).props('dense outlined').classes('grow')
-                    ja_test_btn = ui.button('🔊 音声を生成・再生').props('dense outline')
-
-                ja_audio_container = ui.column().classes('w-full')
-
-                async def run_ja_tts_test() -> None:
-                    txt = (ja_test_text.value or '').strip()
-                    if not txt:
-                        ui.notify('読み上げテキストを入力してください．', type='warning')
-                        return
-                    m = (str(ja_model_select.value) if ja_model_select.value is not None else '').strip()
-                    v = (str(ja_voice_select.value) if ja_voice_select.value is not None else '').strip()
-                    if not ja_base.value or not m or not v:
-                        ui.notify('日本語 TTS の Base URL, Model, Voice を指定してください．', type='warning')
-                        return
-
-                    ja_test_btn.disable()
-                    ja_audio_container.clear()
-                    with ja_audio_container:
-                        ui.label('音声を合成中…').classes('text-xs text-zinc-400')
+                    m_btn.disable()
                     try:
-                        tts_cfg = {
-                            'base_url': ja_base.value.strip(),
-                            'api_key': (ja_key.value or '').strip() or 'dummy',
-                            'model': m,
-                            'voice': v,
-                            'response_format': 'mp3',
-                        }
-                        out_path = self.test_audio_dir / 'test_ja.mp3'
-
-                        def call_tts():
-                            cl = make_client(tts_cfg)
-                            resp = cl.audio.speech.create(
-                                model=tts_cfg['model'],
-                                voice=tts_cfg['voice'],
-                                input=txt,
-                                response_format='mp3',
-                            )
-                            resp.write_to_file(out_path)
-
-                        await run.io_bound(call_tts)
-                        ja_audio_container.clear()
-                        ts = int(time.time() * 1000)
-                        cached_url = f"{file_url(out_path)}?t={ts}"
-                        with ja_audio_container:
-                            ui.audio(cached_url).props('autoplay').classes('w-full max-w-lg mt-1')
-                            ui.label(f'Model: {m} / Voice: {v} で生成完了').classes('text-xs text-zinc-400')
-                        ui.notify('日本語音声を合成しました．', type='positive')
+                        client = await run.io_bound(make_client, {'base_url': b, 'api_key': k})
+                        resp = await run.io_bound(client.models.list)
+                        m_ids = sorted([m.id for m in resp.data])
+                        if not m_ids:
+                            ui.notify('モデルが見つかりませんでした．', type='warning')
+                            return
+                        model_sel.options = m_ids
+                        if model_sel.value not in m_ids:
+                            model_sel.value = m_ids[0]
+                        model_sel.update()
+                        ui.notify(f'{len(m_ids)} 個のモデルを取得しました．', type='positive')
                     except Exception as err:
-                        ja_audio_container.clear()
-                        with ja_audio_container:
-                            ui.label(f'【TTS合成失敗】: {err}').classes('text-xs text-red-400')
-                        ui.notify(f'日本語 TTS テストに失敗しました: {err}', type='negative')
+                        ui.notify(f'モデル一覧取得に失敗しました: {err}', type='negative')
                     finally:
-                        ja_test_btn.enable()
+                        m_btn.enable()
 
-            ja_test_btn.on_click(run_ja_tts_test)
-
-        with ui.card().classes('w-full p-5 bg-zinc-900 border border-zinc-800 rounded-xl gap-4 shadow-sm mt-2'):
-            with ui.row().classes('w-full items-center justify-between border-b border-zinc-800 pb-2'):
-                with ui.row().classes('items-center gap-2'):
-                    ui.label('🇺🇸').classes('text-xl')
-                    ui.label('英語 TTS 設定 (`config.yaml: tts.en`)').classes('text-lg font-bold text-zinc-100')
-                ui.label('※互換API未実装のTTSサーバでは一覧取得できません（直接入力可）').classes('text-xs text-zinc-400')
-
-            with ui.row().classes('w-full items-center gap-4'):
-                en_base = ui.input('英語 Base URL', value=en.get('base_url', '')).classes('grow')
-                en_key = ui.input('英語 API Key', value=en.get('api_key', 'dummy'), password=True, password_toggle_button=True).classes('w-72')
-
-            cur_en_model = en.get('model', '')
-            cur_en_voice = en.get('voice', '')
-
-            with ui.row().classes('w-full items-center gap-4'):
-                en_model_select = ui.select(
-                    options=[cur_en_model] if cur_en_model else [],
-                    value=cur_en_model,
-                    label='英語 Model',
-                ).props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
-
-                en_model_fetch_btn = ui.button('🔄 モデル取得').props('dense outline')
-
-                en_voice_select = ui.select(
-                    options=[cur_en_voice] if cur_en_voice else [],
-                    value=cur_en_voice,
-                    label='英語 Voice / 話者',
-                ).props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
-
-                en_voice_fetch_btn = ui.button('🗣 ボイス取得').props('dense outline')
-
-            async def fetch_en_models() -> None:
-                base = (en_base.value or '').strip()
-                key = (en_key.value or '').strip() or 'dummy'
-                if not base:
-                    ui.notify('先に英語 TTS Base URL を入力してください．', type='warning')
-                    return
-                en_model_fetch_btn.disable()
-                try:
-                    client = await run.io_bound(make_client, {'base_url': base, 'api_key': key})
-                    models_resp = await run.io_bound(client.models.list)
-                    model_ids = sorted([m.id for m in models_resp.data])
-                    if not model_ids:
-                        ui.notify('モデルが見つかりませんでした．', type='warning')
+                async def fetch_voices():
+                    b = (base_in.value or '').strip()
+                    k = (key_in.value or '').strip() or 'dummy'
+                    if not b:
+                        ui.notify(f'先に {lang_name} TTS Base URL を入力してください．', type='warning')
                         return
-                    en_model_select.options = model_ids
-                    if en_model_select.value not in model_ids:
-                        en_model_select.value = model_ids[0]
-                    en_model_select.update()
-                    ui.notify(f'{len(model_ids)} 個のモデルを取得しました．', type='positive')
-                except Exception as err:
-                    ui.notify(f'モデル一覧取得に失敗しました: {err}', type='negative')
-                finally:
-                    en_model_fetch_btn.enable()
-
-            async def fetch_en_voices() -> None:
-                base = (en_base.value or '').strip()
-                key = (en_key.value or '').strip() or 'dummy'
-                if not base:
-                    ui.notify('先に英語 TTS Base URL を入力してください．', type='warning')
-                    return
-                en_voice_fetch_btn.disable()
-                try:
-                    voices = await run.io_bound(self._fetch_voices_from_server, base, key)
-                    if not voices:
-                        ui.notify('ボイス一覧を取得できませんでした（一覧API未対応の可能性）．', type='warning')
-                        return
-                    en_voice_select.options = voices
-                    if en_voice_select.value not in voices:
-                        en_voice_select.value = voices[0]
-                    en_voice_select.update()
-                    ui.notify(f'{len(voices)} 件のボイスを取得しました．', type='positive')
-                except Exception as err:
-                    ui.notify(f'ボイス一覧取得に失敗しました: {err}', type='negative')
-                finally:
-                    en_voice_fetch_btn.enable()
-
-            en_model_fetch_btn.on_click(fetch_en_models)
-            en_voice_fetch_btn.on_click(fetch_en_voices)
-
-            with ui.card().classes('w-full p-3 bg-zinc-950 border border-zinc-800 rounded-lg gap-2'):
-                ui.label('🧪 英語 TTS 接続・音声再生テスト').classes('text-xs font-bold text-zinc-300')
-                with ui.row().classes('w-full items-center gap-2'):
-                    en_test_text = ui.input(
-                        '読み上げテキスト (English)',
-                        value='Hello! This is a test for English text-to-speech synthesis.',
-                    ).props('dense outlined').classes('grow')
-                    en_test_btn = ui.button('🔊 音声を生成・再生').props('dense outline')
-
-                en_audio_container = ui.column().classes('w-full')
-
-                async def run_en_tts_test() -> None:
-                    txt = (en_test_text.value or '').strip()
-                    if not txt:
-                        ui.notify('Text is required.', type='warning')
-                        return
-                    m = (str(en_model_select.value) if en_model_select.value is not None else '').strip()
-                    v = (str(en_voice_select.value) if en_voice_select.value is not None else '').strip()
-                    if not en_base.value or not m or not v:
-                        ui.notify('英語 TTS の Base URL, Model, Voice を指定してください．', type='warning')
-                        return
-
-                    en_test_btn.disable()
-                    en_audio_container.clear()
-                    with en_audio_container:
-                        ui.label('Synthesizing speech...').classes('text-xs text-zinc-400')
+                    v_btn.disable()
                     try:
-                        tts_cfg = {
-                            'base_url': en_base.value.strip(),
-                            'api_key': (en_key.value or '').strip() or 'dummy',
-                            'model': m,
-                            'voice': v,
-                            'response_format': 'mp3',
-                        }
-                        out_path = self.test_audio_dir / 'test_en.mp3'
-
-                        def call_tts():
-                            cl = make_client(tts_cfg)
-                            resp = cl.audio.speech.create(
-                                model=tts_cfg['model'],
-                                voice=tts_cfg['voice'],
-                                input=txt,
-                                response_format='mp3',
-                            )
-                            resp.write_to_file(out_path)
-
-                        await run.io_bound(call_tts)
-                        en_audio_container.clear()
-                        with en_audio_container:
-                            ui.audio(file_url(out_path)).props('autoplay').classes('w-full max-w-lg mt-1')
-                            ui.label(f'Model: {m} / Voice: {v} done').classes('text-xs text-zinc-400')
-                        ui.notify('英語音声を合成しました．', type='positive')
+                        voices = await run.io_bound(self._fetch_voices_from_server, b, k)
+                        if not voices:
+                            ui.notify('ボイス一覧を取得できませんでした（一覧API未対応の可能性）．', type='warning')
+                            return
+                        voice_sel.options = voices
+                        if voice_sel.value not in voices:
+                            voice_sel.value = voices[0]
+                        voice_sel.update()
+                        ui.notify(f'{len(voices)} 件のボイスを取得しました．', type='positive')
                     except Exception as err:
-                        en_audio_container.clear()
-                        with en_audio_container:
-                            ui.label(f'【TTS合成失敗】: {err}').classes('text-xs text-red-400')
-                        ui.notify(f'英語 TTS テストに失敗しました: {err}', type='negative')
+                        ui.notify(f'ボイス一覧取得に失敗しました: {err}', type='negative')
                     finally:
-                        en_test_btn.enable()
+                        v_btn.enable()
 
-            en_test_btn.on_click(run_en_tts_test)
+                m_btn.on_click(fetch_models)
+                v_btn.on_click(fetch_voices)
 
-        return (ja_base, ja_key, ja_model_select, ja_voice_select), (en_base, en_key, en_model_select, en_voice_select)
+                with ui.card().classes('w-full p-3 bg-zinc-950 border border-zinc-800 rounded-lg gap-2'):
+                    ui.label(f'🧪 {lang_name} TTS 接続・音声再生テスト').classes('text-xs font-bold text-zinc-300')
+                    with ui.row().classes('w-full items-center gap-2'):
+                        test_text_in = ui.input('読み上げテキスト', value=default_text).props('dense outlined').classes('grow')
+                        test_btn = ui.button('🔊 音声を生成・再生').props('dense outline')
+
+                    audio_container = ui.column().classes('w-full')
+
+                    async def run_test():
+                        txt = (test_text_in.value or '').strip()
+                        if not txt:
+                            ui.notify('読み上げテキストを入力してください．', type='warning')
+                            return
+                        m = (str(model_sel.value) if model_sel.value is not None else '').strip()
+                        v = (str(voice_sel.value) if voice_sel.value is not None else '').strip()
+                        if not base_in.value or not m or not v:
+                            ui.notify(f'{lang_name} TTS の Base URL, Model, Voice を指定してください．', type='warning')
+                            return
+
+                        test_btn.disable()
+                        audio_container.clear()
+                        with audio_container:
+                            ui.label('音声を合成中…').classes('text-xs text-zinc-400')
+                        try:
+                            t_cfg = {
+                                'base_url': base_in.value.strip(),
+                                'api_key': (key_in.value or '').strip() or 'dummy',
+                                'model': m,
+                                'voice': v,
+                                'response_format': 'mp3',
+                            }
+                            out_p = self.test_audio_dir / test_filename
+
+                            def _call():
+                                cl = make_client(t_cfg)
+                                resp = cl.audio.speech.create(model=m, voice=v, input=txt, response_format='mp3')
+                                resp.write_to_file(out_p)
+
+                            await run.io_bound(_call)
+                            audio_container.clear()
+                            ts = int(time.time() * 1000)
+                            with audio_container:
+                                ui.audio(f"{file_url(out_p)}?t={ts}").props('autoplay').classes('w-full max-w-lg mt-1')
+                                ui.label(f'Model: {m} / Voice: {v} で生成完了').classes('text-xs text-zinc-400')
+                            ui.notify(f'{lang_name} 音声を合成しました．', type='positive')
+                        except Exception as err:
+                            audio_container.clear()
+                            with audio_container:
+                                ui.label(f'【TTS合成失敗】: {err}').classes('text-xs text-red-400')
+                            ui.notify(f'{lang_name} TTS テストに失敗しました: {err}', type='negative')
+                        finally:
+                            test_btn.enable()
+
+                    test_btn.on_click(run_test)
+
+            return base_in, key_in, model_sel, voice_sel
+
+        ja_widgets = _build_single_tts_card('ja', '日本語', ja, 'こんにちは。日本語の音声合成テストです。正常に聞こえますか？', 'test_ja.mp3')
+        en_widgets = _build_single_tts_card('en', '英語', en, 'Hello! This is a test for English text-to-speech synthesis.', 'test_en.mp3')
+        return ja_widgets, en_widgets
 
     def _build_dict_editor(self) -> None:
         filter_cfg = load_tts_filter_config(TTS_FILTER_PATH) if TTS_FILTER_PATH.exists() else {}
@@ -2077,41 +2397,35 @@ class SlideNarratorApp:
                     ui.label('日本語TTS用ヨミ変換フィルタ (`tts_filter.yaml`)').classes('text-lg font-bold text-zinc-100')
                 ui.label('技術用語・識別子・コマンド等の自動ヨミ変換').classes('text-xs text-zinc-400')
 
-            current_filter_model = server_cfg.get('model', '')
+            cur_filter_model = server_cfg.get('model', '')
             with ui.row().classes('w-full items-center gap-4'):
                 filter_base = ui.input('フィルタ用 LLM Base URL', value=server_cfg.get('base_url', '')).classes('grow')
                 filter_key = ui.input('フィルタ用 API Key', value=server_cfg.get('api_key', 'dummy'), password=True, password_toggle_button=True).classes('w-72')
 
             with ui.row().classes('w-full items-center gap-4'):
-                initial_filter_options = [current_filter_model] if current_filter_model else []
-                filter_model_select = ui.select(
-                    options=initial_filter_options,
-                    value=current_filter_model,
-                    label='フィルタ用 LLM Model (選択または直接入力)',
-                ).props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
-
+                filter_model_sel = ui.select(options=[cur_filter_model] if cur_filter_model else [], value=cur_filter_model, label='フィルタ用 LLM Model (選択または直接入力)').props('use-input new-value-mode="add-unique" outlined dense').classes('grow')
                 filter_fetch_btn = ui.button('🔄 モデル一覧を取得').props('dense outline')
                 filter_temp = ui.number('Temperature', value=float(gen_cfg.get('temperature', 0)), min=0, max=2, step=0.1).classes('w-36')
 
             async def fetch_filter_models() -> None:
-                base = (filter_base.value or '').strip()
-                key = (filter_key.value or '').strip() or 'dummy'
-                if not base:
+                b = (filter_base.value or '').strip()
+                k = (filter_key.value or '').strip() or 'dummy'
+                if not b:
                     ui.notify('先にフィルタ用 Base URL を入力してください．', type='warning')
                     return
                 filter_fetch_btn.disable()
                 try:
-                    client = await run.io_bound(make_tts_filter_client, {'server': {'base_url': base, 'api_key': key}})
-                    models_resp = await run.io_bound(client.models.list)
-                    model_ids = sorted([m.id for m in models_resp.data])
-                    if not model_ids:
+                    client = await run.io_bound(make_tts_filter_client, {'server': {'base_url': b, 'api_key': k}})
+                    resp = await run.io_bound(client.models.list)
+                    m_ids = sorted([m.id for m in resp.data])
+                    if not m_ids:
                         ui.notify('モデルが見つかりませんでした．', type='warning')
                         return
-                    filter_model_select.options = model_ids
-                    if filter_model_select.value not in model_ids and model_ids:
-                        filter_model_select.value = model_ids[0]
-                    filter_model_select.update()
-                    ui.notify(f'{len(model_ids)} 個のモデルを取得しました．', type='positive')
+                    filter_model_sel.options = m_ids
+                    if filter_model_sel.value not in m_ids and m_ids:
+                        filter_model_sel.value = m_ids[0]
+                    filter_model_sel.update()
+                    ui.notify(f'{len(m_ids)} 個のモデルを取得しました．', type='positive')
                 except Exception as err:
                     ui.notify(f'モデル一覧取得に失敗しました: {err}', type='negative')
                 finally:
@@ -2122,20 +2436,17 @@ class SlideNarratorApp:
             with ui.card().classes('w-full p-3 bg-zinc-950 border border-zinc-800 rounded-lg gap-2'):
                 ui.label('🧪 ヨミ変換フィルタ リアルタイムテスト').classes('text-xs font-bold text-zinc-300')
                 with ui.row().classes('w-full items-center gap-2'):
-                    filter_test_input = ui.input(
-                        'テスト入力文（技術文書・プログラムなど）',
-                        value='argc と argv を確認し、/usr/bin/python で実行します。cnt++ でカウンタを増やします。',
-                    ).props('dense outlined').classes('grow')
+                    filter_test_in = ui.input('テスト入力文（技術文書・プログラムなど）', value='argc と argv を確認し、/usr/bin/python で実行します。cnt++ でカウンタを増やします。').props('dense outlined').classes('grow')
                     filter_test_btn = ui.button('🔄 ヨミ変換テスト実行').props('dense outline')
 
-                filter_test_result = ui.label('').classes('text-xs text-zinc-300 font-mono p-2 bg-zinc-900 border border-zinc-800 rounded min-h-[36px] w-full whitespace-pre-wrap')
+                filter_test_res = ui.label('').classes('text-xs text-zinc-300 font-mono p-2 bg-zinc-900 border border-zinc-800 rounded min-h-[36px] w-full whitespace-pre-wrap')
 
                 async def run_filter_test() -> None:
-                    src_txt = (filter_test_input.value or '').strip()
+                    src_txt = (filter_test_in.value or '').strip()
                     if not src_txt:
                         ui.notify('テスト対象の文章を入力してください．', type='warning')
                         return
-                    m = (str(filter_model_select.value) if filter_model_select.value is not None else '').strip()
+                    m = (str(filter_model_sel.value) if filter_model_sel.value is not None else '').strip()
                     b = (filter_base.value or '').strip()
                     k = (filter_key.value or '').strip() or 'dummy'
                     if not b or not m:
@@ -2143,29 +2454,21 @@ class SlideNarratorApp:
                         return
 
                     filter_test_btn.disable()
-                    filter_test_result.text = 'ヨミ変換中…'
+                    filter_test_res.text = 'ヨミ変換中…'
                     try:
-                        test_filter_cfg = {
+                        t_cfg = {
                             'server': {'base_url': b, 'api_key': k, 'model': m},
                             'generation': {'temperature': float(filter_temp.value or 0)},
                             'dictionary': filter_dict,
                             'prompt': filter_cfg.get('prompt'),
                         }
-                        client = await run.io_bound(make_tts_filter_client, test_filter_cfg)
-                        system_prompt = build_tts_filter_prompt(test_filter_cfg)
-
-                        transformed = await run.io_bound(
-                            tts_filter_transform,
-                            client=client,
-                            model=m,
-                            system_prompt=system_prompt,
-                            text=src_txt,
-                            generation=test_filter_cfg['generation'],
-                        )
-                        filter_test_result.text = transformed
+                        client = await run.io_bound(make_tts_filter_client, t_cfg)
+                        s_prompt = build_tts_filter_prompt(t_cfg)
+                        res = await run.io_bound(tts_filter_transform, client=client, model=m, system_prompt=s_prompt, text=src_txt, generation=t_cfg['generation'])
+                        filter_test_res.text = res
                         ui.notify('ヨミ変換フィルタを適用しました．', type='positive')
                     except Exception as err:
-                        filter_test_result.text = f'【エラー】\n{err}'
+                        filter_test_res.text = f'【エラー】\n{err}'
                         ui.notify(f'ヨミ変換テストに失敗しました: {err}', type='negative')
                     finally:
                         filter_test_btn.enable()
@@ -2190,13 +2493,12 @@ class SlideNarratorApp:
 
                 ui.button('辞書に追加', on_click=add_word).props('dense outline')
 
-            rows = [{'単語 / 識別子': k, '読みの目安': v} for k, v in filter_dict.items()]
             grid = ui.aggrid({
                 'columnDefs': [
                     {'headerName': '単語 / 識別子', 'field': '単語 / 識別子', 'editable': True},
                     {'headerName': '読みの目安', 'field': '読みの目安', 'editable': True},
                 ],
-                'rowData': rows,
+                'rowData': [{'単語 / 識別子': k, '読みの目安': v} for k, v in filter_dict.items()],
                 ':getRowId': '(params) => params.data[\"単語 / 識別子\"]',
                 'defaultColDef': {'flex': 1, 'resizable': True},
                 'animateRows': False,
@@ -2206,24 +2508,22 @@ class SlideNarratorApp:
             async def save_filter_configuration() -> None:
                 await grid.load_client_data()
                 data = grid.options.get('rowData', [])
-                new_dictionary = {}
+                new_dict = {}
                 for row in data or []:
                     w = str(row.get('単語 / 識別子', '')).strip()
                     r = str(row.get('読みの目安', '')).strip()
                     if w and r and w != 'nan' and r != 'nan':
-                        new_dictionary[w] = r
+                        new_dict[w] = r
 
                 filter_cfg['server'] = {
                     'base_url': (filter_base.value or '').strip(),
                     'api_key': (filter_key.value or '').strip() or 'dummy',
-                    'model': (str(filter_model_select.value) if filter_model_select.value is not None else '').strip(),
+                    'model': (str(filter_model_sel.value) if filter_model_sel.value is not None else '').strip(),
                 }
-                filter_cfg['generation'] = {
-                    'temperature': float(filter_temp.value or 0),
-                }
-                filter_cfg['dictionary'] = new_dictionary
+                filter_cfg['generation'] = {'temperature': float(filter_temp.value or 0)}
+                filter_cfg['dictionary'] = new_dict
                 save_config(TTS_FILTER_PATH, filter_cfg)
-                ui.notify(f'tts_filter.yaml を更新しました（辞書全 {len(new_dictionary)} 件）．', type='positive')
+                ui.notify(f'tts_filter.yaml を更新しました（辞書全 {len(new_dict)} 件）．', type='positive')
 
             ui.button('💾 ヨミ変換設定・辞書 (tts_filter.yaml) を保存', on_click=save_filter_configuration).props('dense outline color=emerald').classes('w-full')
 
@@ -2262,11 +2562,11 @@ class SlideNarratorApp:
                 ui.notify('config.yaml を保存しました．', type='positive')
 
             ui.button('💾 基本設定 (config.yaml) を一括保存', on_click=save_main_config).props('color=primary size=lg').classes('w-full mt-2 mb-2')
-
             self._build_dict_editor()
 
+    # --- ユーザー管理タブ ---
+
     def refresh_user_management(self) -> None:
-        """(2) 管理者用ユーザー管理タブの構築（ハッシュ化・方針B: 管理者は利用制限入力不可・連動制御）"""
         if not self.user_manage_container:
             return
         self.user_manage_container.clear()
@@ -2275,8 +2575,7 @@ class SlideNarratorApp:
         users_dict = users_data.get('users', {})
 
         def calc_future_dt(days: float = 0, hours: float = 0) -> str:
-            target = datetime.now() + timedelta(days=days, hours=hours)
-            return target.strftime('%Y-%m-%d %H:%M')
+            return (datetime.now() + timedelta(days=days, hours=hours)).strftime('%Y-%m-%d %H:%M')
 
         with self.user_manage_container:
             with ui.row().classes('w-full items-center justify-between pb-2'):
@@ -2285,7 +2584,7 @@ class SlideNarratorApp:
                     ui.label('ユーザーアカウント管理 (`users.yaml`)').classes('text-h4 font-bold')
                 ui.label('パスワードはソルト付きハッシュで安全に保護されます．一般ユーザーの利用可能日時を制限できます（管理者は常時無制限）').classes('text-xs text-zinc-400')
 
-            # 新規ユーザー追加カード
+            # 新規ユーザー追加
             with ui.card().classes('w-full p-5 bg-zinc-900 border border-zinc-800 rounded-xl gap-3'):
                 ui.label('➕ 新規ユーザーの追加').classes('text-lg font-bold text-zinc-100')
                 with ui.row().classes('w-full items-center gap-3'):
@@ -2295,7 +2594,6 @@ class SlideNarratorApp:
                     add_from = ui.input('利用開始日時', placeholder='例: 2026-10-09 13:00').props('outlined dense').classes('grow')
                     add_until = ui.input('利用終了日時', placeholder='例: 2026-10-16 13:00').props('outlined dense').classes('grow')
 
-                # 新規追加用のクイック加算ツールバー
                 with ui.row().classes('w-full items-center gap-2 p-2 bg-zinc-950/60 rounded border border-zinc-800/80 text-xs') as add_quick_bar:
                     ui.label('⏱ 終了日時のクイック設定:').classes('text-zinc-400 font-semibold')
                     btn_24h = ui.button('+24時間', on_click=lambda: add_until.set_value(calc_future_dt(hours=24))).props('dense outline size=xs')
@@ -2315,7 +2613,6 @@ class SlideNarratorApp:
                     btn_apply = ui.button('セット', on_click=apply_custom_to_add).props('dense outline color=primary size=xs')
                     btn_clear = ui.button('クリア', on_click=lambda: add_until.set_value('')).props('dense outline color=grey size=xs')
 
-                # 管理者フラグによる新規入力欄の有効/無効連動
                 def update_add_fields(is_adm: bool) -> None:
                     if is_adm:
                         add_from.disable()
@@ -2358,9 +2655,9 @@ class SlideNarratorApp:
                 with ui.row().classes('w-full justify-end pt-1'):
                     ui.button('ユーザーを登録', on_click=handle_add_user).props('color=primary dense').classes('w-44')
 
-            # 既存ユーザー一覧カード
             ui.label(f'登録済みユーザー一覧（全 {len(users_dict)} アカウント）').classes('text-base font-bold text-zinc-200 mt-4')
 
+            # 既存ユーザー一覧カード
             for u_name, u_info in sorted(users_dict.items()):
                 with ui.card().classes('w-full p-4 bg-zinc-900 border border-zinc-800 rounded-xl gap-3'):
                     is_current_user = (u_name == self.username)
@@ -2377,39 +2674,23 @@ class SlideNarratorApp:
                             ui.badge('常時利用可能 (管理者)', color='positive').props('outline')
                         else:
                             is_allowed, status_msg = is_user_within_allowed_period(u_info)
-                            if is_allowed:
-                                ui.badge('利用可能', color='positive').props('outline')
-                            else:
-                                ui.badge(f'利用不可: {status_msg}', color='negative').props('outline')
+                            ui.badge('利用可能' if is_allowed else f'利用不可: {status_msg}', color='positive' if is_allowed else 'negative').props('outline')
 
                     with ui.row().classes('w-full items-center gap-3 pt-1'):
-                        pass_input = ui.input(
-                            '新パスワード',
-                            placeholder='変更時のみ入力',
-                            password=True,
-                            password_toggle_button=True,
-                        ).props('outlined dense').classes('w-44')
-
+                        pass_input = ui.input('新パスワード', placeholder='変更時のみ入力', password=True, password_toggle_button=True).props('outlined dense').classes('w-44')
                         admin_check = ui.checkbox('管理者権限', value=is_user_admin).classes('text-zinc-300')
                         if is_current_user:
                             admin_check.disable()
 
-                        from_input = ui.input(
-                            '利用開始日時',
-                            value='' if is_user_admin else str(u_info.get('valid_from', ''))
-                        ).props('outlined dense placeholder="YYYY-MM-DD HH:MM"').classes('grow')
-                        until_input = ui.input(
-                            '利用終了日時',
-                            value='' if is_user_admin else str(u_info.get('valid_until', ''))
-                        ).props('outlined dense placeholder="YYYY-MM-DD HH:MM"').classes('grow')
+                        from_input = ui.input('利用開始日時', value='' if is_user_admin else str(u_info.get('valid_from', ''))).props('outlined dense placeholder="YYYY-MM-DD HH:MM"').classes('grow')
+                        until_input = ui.input('利用終了日時', value='' if is_user_admin else str(u_info.get('valid_until', ''))).props('outlined dense placeholder="YYYY-MM-DD HH:MM"').classes('grow')
 
-                    # 既存ユーザー用のクイック加算ツールバー
                     with ui.row().classes('w-full items-center gap-2 p-1.5 bg-zinc-950/40 rounded border border-zinc-800 text-xs') as row_quick_bar:
                         ui.label('⏱ 終了日時のクイック加算:').classes('text-zinc-400 font-semibold')
                         r_btn_24h = ui.button('+24h', on_click=lambda target_in=until_input: target_in.set_value(calc_future_dt(hours=24))).props('dense outline size=xs')
                         r_btn_3d = ui.button('+3日', on_click=lambda target_in=until_input: target_in.set_value(calc_future_dt(days=3))).props('dense outline size=xs')
-                        r_btn_7d = ui.button('+7日', on_click=lambda target_in=until_input: target_in.set_value(calc_future_dt(days=7))).props('dense outline size=xs')
-                        r_btn_30d = ui.button('+30日', on_click=lambda target_in=until_input: target_in.set_value(calc_future_dt(days=30))).props('dense outline size=xs')
+                        r_btn_7d = ui.button('+7日 (1週間)', on_click=lambda target_in=until_input: target_in.set_value(calc_future_dt(days=7))).props('dense outline size=xs')
+                        r_btn_30d = ui.button('+30日 (1ヶ月)', on_click=lambda target_in=until_input: target_in.set_value(calc_future_dt(days=30))).props('dense outline size=xs')
 
                         ui.label('│').classes('text-zinc-600')
                         row_days = ui.number('日', value=7, min=0, max=365).props('dense outlined size=xs').classes('w-14')
@@ -2423,7 +2704,6 @@ class SlideNarratorApp:
                         r_btn_apply = ui.button('加算セット', on_click=apply_row_custom).props('dense outline color=primary size=xs')
                         r_btn_clear = ui.button('制限解除 (空欄)', on_click=lambda target_in=until_input: target_in.set_value('')).props('dense outline color=grey size=xs')
 
-                    # 管理者フラグに応じた入力制限（方針B）
                     def update_row_fields(is_adm: bool, fi=from_input, ui_=until_input, bar=row_quick_bar,
                                           widgets=(r_btn_24h, r_btn_3d, r_btn_7d, r_btn_30d, row_days, row_hours, r_btn_apply, r_btn_clear)):
                         if is_adm:
@@ -2441,22 +2721,18 @@ class SlideNarratorApp:
                                 w.enable()
                             bar.classes(remove='opacity-40 pointer-events-none')
 
-                    # 初期状態の反映
                     update_row_fields(is_user_admin)
                     admin_check.on_value_change(lambda e, upd=update_row_fields: upd(bool(e.value)))
 
                     with ui.row().classes('w-full justify-end items-center gap-3 pt-1'):
                         async def handle_update(target=u_name, p=pass_input, a=admin_check, vf=from_input, vu=until_input):
                             new_admin_val = bool(a.value)
-
-                            # 管理者権限剥奪の安全ガード
                             if users_dict[target].get('is_admin') and not new_admin_val:
                                 if target == self.username:
                                     ui.notify('自分自身の管理者権限を外すことはできません．', type='negative')
                                     a.value = True
                                     return
-                                admin_count = sum(1 for u in users_dict.values() if u.get('is_admin', False))
-                                if admin_count <= 1:
+                                if sum(1 for u in users_dict.values() if u.get('is_admin', False)) <= 1:
                                     ui.notify('システム内に管理者がいなくなるため、最後の管理者権限を外すことはできません．', type='negative')
                                     a.value = True
                                     return
@@ -2466,7 +2742,6 @@ class SlideNarratorApp:
                                 users_dict[target]['password'] = hash_password(new_pw)
 
                             users_dict[target]['is_admin'] = new_admin_val
-                            # 管理者の場合は日時設定を空文字にして保存
                             users_dict[target]['valid_from'] = '' if new_admin_val else (vf.value or '').strip()
                             users_dict[target]['valid_until'] = '' if new_admin_val else (vu.value or '').strip()
                             save_users(users_data)
@@ -2489,9 +2764,7 @@ class SlideNarratorApp:
                         if not is_current_user:
                             ui.button('削除', on_click=handle_delete).props('outline color=negative dense')
 
-    async def refresh_all(self) -> None:
-        await self.refresh_views()
-        await self.refresh_final_video()
+    # --- 画面レイアウト構築 ---
 
     def build(self) -> None:
         ui.page_title('Slide Narrator')
@@ -2499,13 +2772,13 @@ class SlideNarratorApp:
         ui.colors(primary='#3b82f6')
 
         current_username = app.storage.user.get('username', '')
-        is_guest = (current_username == 'guest')
         is_admin = app.storage.user.get('is_admin', False)
 
         def logout() -> None:
             app.storage.user.clear()
             ui.navigate.to('/login')
 
+        # ヘッダー
         with ui.header().classes('items-center w-full px-4 bg-slate-900 border-b border-slate-800'):
             ui.label('🎓 Slide Narrator').classes('text-h5 text-white')
             ui.space()
@@ -2515,9 +2788,12 @@ class SlideNarratorApp:
             ui.button('ログアウト', on_click=logout).props('dense outline size=sm color=white').classes('mr-3')
             ui.label('TAKAGO_LAB. 2026').classes('text-subtitle2 font-mono tracking-wider text-slate-300 mr-2')
 
+        # 左サイドドロワー
         with ui.left_drawer(value=True).props('width=320').classes('p-4'):
             ui.label('プロジェクト設定').classes('text-h5')
-            ui.label(f'作業場所: webui_uploads/{self.username}/').classes('text-[11px] text-zinc-400 font-mono pb-1')
+            if self.read_only:
+                ui.label('閲覧モード：利用可能時間外のため編集・生成はできません．').classes('text-sm text-amber-400')
+            ui.timer(2.0, self.refresh_job_status)
 
             self.uploader = (
                 ui.upload(
@@ -2529,13 +2805,10 @@ class SlideNarratorApp:
                 .props('accept=.pdf')
                 .classes('w-full')
             )
-            self.uploader.on(
-                'added',
-                lambda: self.uploader.run_method(
-                    'eval',
-                    'if (this.files.length > 1) { this.removeFile(this.files[0]); }',
-                ),
-            )
+            if self.read_only:
+                self.uploader.disable()
+
+            self.uploader.on('added', lambda: self.uploader.run_method('eval', 'if (this.files.length > 1) { this.removeFile(this.files[0]); }'))
 
             self.mode_select = ui.radio({'lecture': '🎓 講義', 'research': '🔬 研究発表'}, value=self.mode_code).props('inline')
             self.mode_select.on_value_change(lambda e: self._mode_changed(e.value))
@@ -2543,10 +2816,7 @@ class SlideNarratorApp:
             self.lang_select.on_value_change(lambda e: self._lang_changed(e.value))
 
             with ui.card().classes('w-full p-2.5 bg-zinc-900 border border-zinc-800 rounded-lg mt-2'):
-                self.default_vlm_switch = ui.switch(
-                    'VLMを活用してポインタ配置を決定する',
-                    value=self.default_use_vlm,
-                ).props('dense color=primary')
+                self.default_vlm_switch = ui.switch('VLMを活用してポインタ配置を決定する', value=self.default_use_vlm).props('dense color=primary')
                 self.default_vlm_switch.tooltip('ONにすると図形・数式・グラフの内部要素まで細かくポインティングします．OFFにするとPDFテキストのみを使用します．')
                 self.default_vlm_switch.on_value_change(lambda e: self._default_vlm_changed(e.value))
 
@@ -2559,15 +2829,50 @@ class SlideNarratorApp:
             self.active_count_label = ui.label('対象スライド: 0 / 0 スライド')
             ui.separator()
             ui.label('パイプライン実行').classes('text-h6')
+
+            with ui.row().classes('hidden w-full items-center gap-2 p-2 bg-amber-500/10 border border-amber-500/30 rounded-lg mb-2') as self.pipeline_busy_row:
+                ui.spinner(size='xs', color='warning')
+                self.pipeline_busy_notice = ui.label('').classes('text-xs font-bold text-amber-400')
+
+            self.stage_widgets.clear()
+            self.pipeline_buttons.clear()
+
+            for key, label, initial_msg in STAGE_DEFINITIONS:
+                with ui.column().classes('w-full gap-1 mb-2'):
+                    btn = ui.button(label, on_click=lambda k=key, m=initial_msg: self.handle_pipeline_button(k, m)).props('color=primary').classes('w-full')
+                    self.pipeline_buttons.append(btn)
+
+                    with ui.column().classes('w-full px-1 hidden gap-1') as progress_box:
+                        with ui.row().classes('w-full items-center justify-between text-[11px]'):
+                            with ui.row().classes('items-center gap-1.5'):
+                                p_spinner = ui.spinner(size='xs', color='primary').classes('hidden')
+                                p_label = ui.label('準備中…').classes('font-bold text-zinc-300')
+
+                        p_bar = ui.linear_progress(value=0.0, show_value=False).props('rounded size=6px color=positive').classes('w-full hidden')
+                        p_indet = ui.linear_progress(value=0.0, show_value=False).props('indeterminate rounded size=6px color=positive').classes('w-full')
+
+                    self.stage_widgets[key] = {
+                        'button': btn,
+                        'box': progress_box,
+                        'spinner': p_spinner,
+                        'label': p_label,
+                        'bar': p_bar,
+                        'indeterminate': p_indet,
+                    }
+
             self.force_checkbox = ui.checkbox('キャッシュを破棄してやり直す', value=False)
             self.force_checkbox.tooltip('チェックを入れると、生成済みのナレーション・音声・動画ファイルをスキップせずにすべて作り直します．')
             self.force_checkbox.on_value_change(lambda e: setattr(self, 'force_run', bool(e.value)))
-            self.pipeline_buttons = [
-                ui.button('① ナレーション原稿の生成', on_click=lambda: self.pipeline('explain', '① ナレーション原稿を作成中…')).classes('w-full'),
-                ui.button('② 翻訳，字幕生成，ポインタ配置', on_click=lambda: self.pipeline('align', '② 翻訳と字幕，ポインタ配置を決定中…')).classes('w-full'),
-                ui.button('③ ナレーション音声の作成', on_click=lambda: self.pipeline('tts', f'③ ナレーション音声を作成中…')).classes('w-full'),
-                ui.button('④ ナレーションビデオの作成', on_click=lambda: self.pipeline('video', '④ ナレーションビデオを作成中…')).classes('w-full'),
-            ]
+
+            if self.read_only:
+                for button in self.pipeline_buttons:
+                    button.disable()
+                self.force_checkbox.disable()
+                self.mode_select.disable()
+                self.lang_select.disable()
+                self.default_vlm_switch.disable()
+                self.pages_input.disable()
+
             ui.separator()
             ui.label('🎬 完成ビデオ').classes('text-subtitle1 font-bold text-zinc-200')
             self.final_video_container = ui.column().classes('w-full gap-2')
@@ -2575,15 +2880,17 @@ class SlideNarratorApp:
             ui.label('TAKAGO LAB., KIT, Japan.').classes('text-caption')
             ui.link('GitHub: takago/slide-narrator', 'https://github.com/takago/slide-narrator', new_tab=True)
 
+        # メインタブエリア
         with ui.column().classes('w-full p-6'):
             with ui.tabs().classes('w-full') as tabs:
                 self.tabs = tabs
                 tab_gallery = ui.tab('🖼 スライドデッキ')
-                tab_simple_edit = ui.tab('📋 ナレーション修正（簡易）')
-                tab_edit = ui.tab('📝 ナレーション修正（詳細）')
+                if not self.read_only:
+                    tab_simple_edit = ui.tab('📋 ナレーション修正（簡易）')
+                    tab_edit = ui.tab('📝 ナレーション修正（詳細）')
                 tab_slide_videos = ui.tab('🎞 ビデオデッキ')
                 tab_logs = ui.tab('📜 ログ')
-                if not is_guest:
+                if is_admin and not self.read_only:
                     tab_settings = ui.tab('⚙ 設定')
                 if is_admin:
                     tab_user_manage = ui.tab('👥 ユーザー管理')
@@ -2592,49 +2899,63 @@ class SlideNarratorApp:
                 with ui.tab_panel(tab_gallery):
                     ui.label('🖼️ スライドデッキ').classes('text-h5')
                     self.gallery = ui.column().classes('w-full')
-                with ui.tab_panel(tab_simple_edit):
-                    ui.label('📋 ナレーション修正（簡易）').classes('text-h5')
-                    self.simple_edit_container = ui.column().classes('w-full')
-                with ui.tab_panel(tab_edit):
-                    self.edit_container = ui.column().classes('w-full')
+                if not self.read_only:
+                    with ui.tab_panel(tab_simple_edit):
+                        ui.label('📋 ナレーション修正（簡易）').classes('text-h5')
+                        self.simple_edit_container = ui.column().classes('w-full')
+                    with ui.tab_panel(tab_edit):
+                        self.edit_container = ui.column().classes('w-full')
                 with ui.tab_panel(tab_slide_videos):
                     ui.label('🎞 ビデオデッキ').classes('text-h5')
                     self.slide_video_gallery = ui.column().classes('w-full')
                 with ui.tab_panel(tab_logs):
                     with ui.row().classes('w-full items-center justify-between pb-2'):
                         ui.label('📜 実行ログ履歴').classes('text-h5')
-                        ui.button('ログをクリア', on_click=lambda: self.history_log_widget.clear() if self.history_log_widget else None).props('dense outline size=sm color=negative')
-                    self.history_log_widget = ui.log(max_lines=2000).classes('w-full h-[650px] font-mono text-xs bg-zinc-900 border border-zinc-700 rounded-lg p-3 text-zinc-300')
-                    if self.log:
-                        for line in self.log.splitlines():
-                            self.history_log_widget.push(line)
-                if not is_guest:
+                        ui.button('ログをクリア', on_click=self.clear_job_log).props('dense outline size=sm color=negative')
+                    self.history_log_widget = ui.column().classes('w-full h-[650px] overflow-y-auto flex-nowrap gap-0 bg-zinc-900 border border-zinc-700 rounded-lg p-3')
+                    self._loaded_log_text = None
+                    self.refresh_history_log()
+                if is_admin and not self.read_only:
                     with ui.tab_panel(tab_settings):
                         self.settings_container = ui.column().classes('w-full')
                 if is_admin:
                     with ui.tab_panel(tab_user_manage):
                         self.user_manage_container = ui.column().classes('w-full')
 
-        if not is_guest:
+            tabs.on_value_change(lambda e: self.refresh_output_views_on_tab_change())
+
+        if is_admin and not self.read_only:
             self.refresh_settings()
         if is_admin:
             self.refresh_user_management()
 
+        asyncio.create_task(self.restore_last_project())
+
+    # --- ユーザー入力イベント ---
+
     def _mode_changed(self, value: str) -> None:
+        if not self.write_access_allowed():
+            return
         self.mode_code = value
         self.save_project_settings()
 
     def _lang_changed(self, value: str) -> None:
+        if not self.write_access_allowed():
+            return
         self.lang_code = value
         self.save_project_settings()
         asyncio.create_task(self.refresh_simple_editor())
         asyncio.create_task(self.refresh_editor())
 
     def _default_vlm_changed(self, value: bool) -> None:
+        if not self.write_access_allowed():
+            return
         self.default_use_vlm = bool(value)
         self.save_project_settings()
 
     def _range_changed(self) -> None:
+        if not self.write_access_allowed():
+            return
         new_val = self.pages_input.value or ''
         if new_val == self.pages_spec:
             return
@@ -2643,6 +2964,10 @@ class SlideNarratorApp:
         except Exception as exc:
             ui.notify(f'スライド範囲を解釈できません: {exc}', type='negative')
 
+
+# ----------------------------------------------------------------------
+# Application Routing & Authentication Pages
+# ----------------------------------------------------------------------
 
 @ui.page('/')
 def index_page():
@@ -2653,11 +2978,6 @@ def index_page():
     users_data = load_users().get('users', {})
     u_info = users_data.get(username)
     if not u_info:
-        app.storage.user.clear()
-        return RedirectResponse('/login')
-
-    allowed, err = is_user_within_allowed_period(u_info)
-    if not allowed:
         app.storage.user.clear()
         return RedirectResponse('/login')
 
@@ -2682,22 +3002,14 @@ def login_page():
         users_dict = users_data.get('users', {})
         user_info = users_dict.get(username)
 
-        # パスワード検証（平文互換判定含む）
         if not user_info or not verify_password(password, str(user_info.get('password', ''))):
             ui.notify('ユーザー名またはパスワードが正しくありません．', type='negative')
             return
 
-        # 既存の平文パスワードだった場合、初回認証成功時に自動でハッシュ化して保存更新
         stored_pw = str(user_info.get('password', ''))
         if not stored_pw.startswith('pbkdf2:sha256:'):
             user_info['password'] = hash_password(password)
             save_users(users_data)
-
-        # 利用可能日時制限のチェック
-        allowed, reason = is_user_within_allowed_period(user_info)
-        if not allowed:
-            ui.notify(f'ログイン拒否: {reason}', type='negative')
-            return
 
         app.storage.user['authenticated'] = True
         app.storage.user['username'] = username
@@ -2717,4 +3029,11 @@ def login_page():
         ui.button('ログイン', on_click=try_login).props('color=primary').classes('w-full mt-2')
 
 
-ui.run(title='Slide Narrator', reload=False, show=False, port=17171, host='0.0.0.0', storage_secret='slide-narrator-session-secret-key-change-in-prod')
+ui.run(
+    title='Slide Narrator',
+    reload=False,
+    show=False,
+    port=17171,
+    host='0.0.0.0',
+    storage_secret='slide-narrator-session-secret-key-change-in-prod',
+)
