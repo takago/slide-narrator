@@ -1,5 +1,5 @@
 # slide-narrator
-Turn your PDF presentation slides into narrated lecture videos with AI.
+Turn PDF slides into narrated videos automatically with AI.
 
 > **Note:** I chose the name `slide-narrator` when I created this repository, and only later discovered that several unrelated projects and packages use the same name. This project is independent of those projects.
 >
