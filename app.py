@@ -3452,7 +3452,7 @@ def login_page():
                     ui.icon('movie', size='48px').classes('text-blue-400')
                 ui.label('Slide Narrator').classes('text-xl font-bold tracking-tight text-white')
                 # whitespace-nowrap を追加（1行維持）
-                ui.label('Turn your PDF presentation slides into narrated lecture videos with AI.').classes('text-xs text-zinc-400 whitespace-nowrap')
+                ui.label('Turn PDF slides into narrated videos automatically with AI.').classes('text-xs text-zinc-400 whitespace-nowrap')
             # サーバーが実行中だった場合のみ静的にスピナーを表示
             if is_busy:
                 with ui.row().classes('w-full items-center gap-2.5 p-2.5 bg-amber-500/10 border border-amber-500/30 rounded-lg'):
