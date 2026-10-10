@@ -20,8 +20,10 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta
 import hashlib
+import httpx
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import shutil
@@ -490,6 +492,8 @@ class SlideNarratorApp:
 
         # ワークスペース
         self.user_dir = get_user_workspace(self.username)
+        self.projects_dir = self.user_dir / 'projects'
+        self.projects_dir.mkdir(parents=True, exist_ok=True)
         self.test_audio_dir = self.user_dir / 'test_audio'
         self.test_audio_dir.mkdir(exist_ok=True)
         self.test_vlm_dir = self.user_dir / 'test_vlm'
@@ -520,7 +524,6 @@ class SlideNarratorApp:
         # UI ウィジェット参照
         self.job_status_label = None
         self.history_log_widget = None
-        self._history_log_entries: list[Any] = []
         self.tabs = None
         self.gallery = None
         self.simple_edit_container = None
@@ -530,6 +533,8 @@ class SlideNarratorApp:
         self.settings_container = None
         self.user_manage_container = None
         self.uploader = None
+        self.project_select = None
+        self.project_name_input = None
         self.active_count_label = None
         self.mode_select = None
         self.lang_select = None
@@ -583,71 +588,30 @@ class SlideNarratorApp:
                 pass
         return status
 
-    @staticmethod
-    def _log_line_classes(line: str) -> str:
-        """ログの内容に応じて，表示用の文字色を返す．"""
-        upper = line.upper()
-        if '[ERROR]' in upper or 'TRACEBACK' in upper or 'EXCEPTION' in upper or '失敗' in line or 'エラー' in line:
-            color = 'text-red-400'
-        elif '[CANCEL]' in upper or '中断' in line:
-            color = 'text-orange-300'
-        elif '[WARN' in upper or 'WARNING' in upper or '警告' in line:
-            color = 'text-amber-300'
-        elif '[REGEN]' in upper or '[ALIGN]' in upper or '[TTS]' in upper:
-            color = 'text-cyan-300'
-        elif '[PROGRESS]' in upper or '完了' in line or '終了' in line:
-            color = 'text-emerald-300'
-        elif '開始' in line or '[INFO]' in upper:
-            color = 'text-sky-300'
-        else:
-            color = 'text-zinc-300'
-        return f'font-mono text-xs whitespace-pre-wrap break-words leading-5 {color}'
-
-    def _append_history_log_line(self, line: str) -> None:
-        if self.history_log_widget is None:
-            return
-        with self.history_log_widget:
-            entry = ui.label(line).classes(self._log_line_classes(line))
-        self._history_log_entries.append(entry)
-        # ui.log(max_lines=2000) と同様に，表示は直近2000行に制限する．
-        while len(self._history_log_entries) > 2000:
-            old_entry = self._history_log_entries.pop(0)
-            try:
-                old_entry.delete()
-            except Exception:
-                pass
-
     def append_job_log(self, line: str) -> None:
         line = str(line)
         append_user_job_log(self.username, line)
         if self.history_log_widget is not None:
-            try:
-                self._append_history_log_line(f'[{datetime.now().strftime("%H:%M:%S")}] {line}')
-            except Exception:
-                pass
+            self.history_log_widget.push(f'[{datetime.now().strftime("%H:%M:%S")}] {line}')
         self._loaded_log_text = None
 
     def clear_job_log(self) -> None:
         clear_user_job_log(self.username)
         self._loaded_log_text = ''
-        self._history_log_entries.clear()
         if self.history_log_widget is not None:
-            try:
-                self.history_log_widget.clear()
-            except Exception:
-                pass
+            self.history_log_widget.clear()
 
     def refresh_history_log(self) -> None:
         if self.history_log_widget is None:
             return
         contents = read_user_job_log(self.username)
+        # すでに読み込み済みと同じ内容であればスキップ
         if contents == self._loaded_log_text:
             return
         try:
             self.history_log_widget.clear()
-            self._history_log_entries.clear()
             for line in contents.splitlines()[-2000:]:
-                self._append_history_log_line(line)
+                self.history_log_widget.push(line)
             self._loaded_log_text = contents
         except Exception:
             pass
@@ -904,112 +868,124 @@ class SlideNarratorApp:
         asyncio.create_task(self.refresh_final_video())
         self.refresh_history_log()
 
-    # --- PDF 読み込み & 復元 ---
+    # --- プロジェクト一覧・名前・削除 ---
 
-    async def load_pdf(self, e) -> None:
-        if not self.write_access_allowed():
+    def list_user_projects(self) -> list[Path]:
+        """IDごとのプロジェクトディレクトリ内にある元PDFを列挙する．"""
+        projects: list[Path] = []
+        if not self.projects_dir.exists():
+            return projects
+        for project_dir in self.projects_dir.iterdir():
+            if not project_dir.is_dir() or not re.fullmatch(r"\d{8}\.[A-Za-z0-9_]{4,12}", project_dir.name):
+                continue
+            pdfs = sorted((p for p in project_dir.glob('*.pdf') if p.is_file()), key=lambda p: p.name.lower())
+            if pdfs:
+                projects.append(pdfs[0])
+        return sorted(projects, key=lambda p: p.parent.stat().st_mtime, reverse=True)
+
+    @staticmethod
+    def project_display_name(pdf_path: Path) -> str:
+        cfg = load_project_json(ProjectPaths(pdf_path).root)
+        name = str(cfg.get('project_name') or '').strip()
+        return name or pdf_path.stem
+
+    def refresh_project_list(self) -> None:
+        if self.project_select is None:
             return
-        filename = Path(e.file.name).name
-        target_pdf = self.user_dir / filename
-        target_paths = ProjectPaths(target_pdf)
-
-        temp_pdf = self.user_dir / f".upload_{int(time.time())}_{filename}"
-        await e.file.save(temp_pdf)
-
-        has_existing = target_paths.root.exists() or target_pdf.exists()
-
-        async def finalize_loading(delete_existing: bool) -> None:
-            if not self.write_access_allowed():
-                try:
-                    temp_pdf.unlink(missing_ok=True)
-                except Exception:
-                    pass
-                return
-            if delete_existing:
-                if target_paths.root.exists():
-                    shutil.rmtree(target_paths.root, ignore_errors=True)
-                if target_pdf.exists():
-                    target_pdf.unlink()
-                ui.notify(f'既存のプロジェクトデータを削除しました: {target_paths.root.name}', type='info')
-
-            temp_pdf.replace(target_pdf)
-            self.pdf = target_pdf
-            self.paths = target_paths
-
-            last_file = user_last_project_file(self.username)
-            temp_last = last_file.with_name(last_file.name + '.tmp')
-            temp_last.write_text(json.dumps({'pdf': target_pdf.name}, ensure_ascii=False), encoding='utf-8')
-            temp_last.replace(last_file)
-
-            self.proj_cfg = load_project_json(self.paths.root)
-            self.mode_code = self.proj_cfg.get('mode') or self.cfg.get('mode', 'lecture')
-            self.lang_code = self.proj_cfg.get('language') or self.cfg.get('language', 'ja')
-
-            saved_vmode = self.proj_cfg.get('visual_mode') or self.cfg.get('visual_mode', 'vlm')
-            self.default_use_vlm = saved_vmode in ('vlm', 'auto', True, 'true')
-            self.slide_visual_modes = self.proj_cfg.get('slide_visual_modes', {})
-
-            self.images = await run.io_bound(
-                ensure_page_images, self.paths, int(self.cfg.get('pdf', {}).get('dpi', 120))
-            )
-
-            saved_pages_spec = self.proj_cfg.get('pages', '')
-            self.apply_pages_spec(saved_pages_spec, save_and_refresh=False)
-
-            self.refresh_project_widgets()
-            await self.refresh_all()
-            ui.notify(f'プレゼンテーションを読み込みました: {target_pdf.name}', type='positive')
-
-        if has_existing:
-            with ui.dialog() as dialog, ui.card().classes('p-5 gap-4 max-w-md'):
-                dialog.props('persistent')
-                with ui.row().classes('items-center gap-2 text-warning'):
-                    ui.icon('warning', size='md').classes('text-amber-500')
-                    ui.label('既存プロジェクトが見つかりました').classes('text-base font-bold text-zinc-100')
-
-                ui.label(
-                    f'「{filename}」に対応する既存フォルダ（{target_paths.root.name}）が既に存在します。'
-                    'フォルダ一式（生成済みのナレーション原稿・音声・動画など）をすべて削除して新しくやり直しますか？'
-                ).classes('text-sm text-zinc-300 leading-relaxed')
-
-                with ui.row().classes('w-full justify-end gap-3 pt-2'):
-                    async def on_keep():
-                        dialog.close()
-                        await finalize_loading(delete_existing=False)
-
-                    async def on_delete():
-                        dialog.close()
-                        await finalize_loading(delete_existing=True)
-
-                    ui.button('既存データを引き継ぐ', on_click=on_keep).props('outline color=grey')
-                    ui.button('一式を削除して初期化', on_click=on_delete).props('color=negative')
-
-            dialog.open()
-        else:
-            await finalize_loading(delete_existing=False)
-
-    async def restore_last_project(self) -> None:
-        if self._restore_started:
-            return
-        self._restore_started = True
+        projects = self.list_user_projects()
+        options = {pdf_path.parent.name: self.project_display_name(pdf_path) for pdf_path in projects}
+        current_value = self.pdf.parent.name if self.pdf and self.pdf.exists() else None
         try:
-            marker = user_last_project_file(self.username)
-            try:
-                data = json.loads(marker.read_text(encoding='utf-8'))
-                filename = Path(str(data.get('pdf', ''))).name
-            except (OSError, ValueError, TypeError):
-                existing_pdfs = list(self.user_dir.glob('*.pdf'))
-                if not existing_pdfs:
-                    return
-                filename = max(existing_pdfs, key=lambda item: item.stat().st_mtime).name
-                marker.write_text(json.dumps({'pdf': filename}, ensure_ascii=False), encoding='utf-8')
+            self.project_select.options = options
+            self.project_select.value = current_value if current_value in options else None
+            self.project_select.update()
+        except Exception:
+            pass
 
-            if not filename or filename in ('.', '..'):
-                return
-            target_pdf = (self.user_dir / filename).resolve()
-            if target_pdf.parent != self.user_dir.resolve() or not target_pdf.is_file():
-                return
+    def refresh_project_name_input(self) -> None:
+        if self.project_name_input is not None:
+            name = self.project_display_name(self.pdf) if self.pdf and self.pdf.exists() else ''
+            self.project_name_input.value = name
+            if self.pdf and self.pdf.exists() and not self.read_only:
+                self.project_name_input.enable()
+            else:
+                self.project_name_input.disable()
 
+    def request_rename_project(self) -> None:
+        """現在のプロジェクト名をダイアログで変更する．"""
+        if not self.write_access_allowed() or not self.pdf or not self.paths:
+            return
+        if GLOBAL_EXECUTION_LOCK.is_locked():
+            ui.notify('処理中はプロジェクト名を変更できません．', type='warning')
+            return
+        current_name = self.project_display_name(self.pdf)
+        with ui.dialog() as dialog, ui.card().classes('p-5 gap-4 w-full max-w-md'):
+            ui.label('プロジェクト名の変更').classes('text-base font-bold')
+            name_input = ui.input('プロジェクト名', value=current_name).props('outlined autofocus').classes('w-full')
+            with ui.row().classes('w-full justify-end gap-2'):
+                ui.button('キャンセル', on_click=dialog.close).props('outline color=grey')
+                def save_name() -> None:
+                    name = str(name_input.value or '').strip()
+                    if not name:
+                        ui.notify('プロジェクト名を入力してください．', type='warning')
+                        return
+                    if len(name) > 100:
+                        ui.notify('プロジェクト名は100文字以内にしてください．', type='warning')
+                        return
+                    if not self.write_access_allowed() or not self.pdf or not self.paths:
+                        return
+                    if GLOBAL_EXECUTION_LOCK.is_locked():
+                        ui.notify('処理中はプロジェクト名を変更できません．', type='warning')
+                        return
+                    self.proj_cfg['project_name'] = name
+                    save_project_json(self.paths.root, self.proj_cfg)
+                    self.refresh_project_list()
+                    dialog.close()
+                    ui.notify('プロジェクト名を変更しました．', type='positive')
+                ui.button('保存', on_click=save_name, icon='save').props('color=primary')
+        dialog.open()
+
+    def save_project_name(self) -> None:
+        if not self.write_access_allowed() or not self.pdf or not self.paths:
+            return
+        name = str(self.project_name_input.value or '').strip() if self.project_name_input else ''
+        if not name:
+            ui.notify('プロジェクト名を入力してください．', type='warning')
+            return
+        if len(name) > 100:
+            ui.notify('プロジェクト名は100文字以内にしてください．', type='warning')
+            return
+        self.proj_cfg['project_name'] = name
+        save_project_json(self.paths.root, self.proj_cfg)
+        self.refresh_project_list()
+        self.refresh_project_name_input()
+        ui.notify('プロジェクト名を保存しました．', type='positive')
+
+    async def select_existing_project(self, project_id: str | None) -> None:
+        if not project_id:
+            return
+        if GLOBAL_EXECUTION_LOCK.is_locked():
+            ui.notify('処理中はプロジェクトを切り替えられません．', type='warning')
+            self.refresh_project_list()
+            return
+        if not re.fullmatch(r"\d{8}\.[A-Za-z0-9_]{4,12}", str(project_id)):
+            ui.notify('プロジェクトIDが不正です．', type='negative')
+            self.refresh_project_list()
+            return
+        project_dir = (self.projects_dir / project_id).resolve()
+        if project_dir.parent != self.projects_dir.resolve() or not project_dir.is_dir():
+            ui.notify('選択したプロジェクトが見つかりません．', type='negative')
+            self.refresh_project_list()
+            return
+        pdfs = [p for p in project_dir.glob('*.pdf') if p.is_file()]
+        if len(pdfs) != 1:
+            ui.notify('プロジェクト内の元PDFを一意に特定できません．', type='negative')
+            self.refresh_project_list()
+            return
+        target_pdf = pdfs[0].resolve()
+        if self.pdf and target_pdf == self.pdf.resolve():
+            return
+        try:
             self.pdf = target_pdf
             self.paths = ProjectPaths(target_pdf)
             self.proj_cfg = load_project_json(self.paths.root)
@@ -1019,19 +995,188 @@ class SlideNarratorApp:
             self.default_use_vlm = saved_vmode in ('vlm', 'auto', True, 'true')
             self.slide_visual_modes = self.proj_cfg.get('slide_visual_modes', {})
             self.images = await run.io_bound(ensure_page_images, self.paths, int(self.cfg.get('pdf', {}).get('dpi', 120)))
+            marker = user_last_project_file(self.username)
+            temp_marker = marker.with_name(marker.name + '.tmp')
+            temp_marker.write_text(json.dumps({'project_id': project_id}, ensure_ascii=False), encoding='utf-8')
+            temp_marker.replace(marker)
             self.apply_pages_spec(self.proj_cfg.get('pages', ''), save_and_refresh=False)
             self.refresh_project_widgets()
+            self.refresh_project_list()
+            self.refresh_project_name_input()
             await self.refresh_all()
+            ui.notify(f'プロジェクト「{self.project_display_name(target_pdf)}」を開きました．', type='positive')
+        except Exception as exc:
+            ui.notify(f'プロジェクトを開けませんでした: {exc}', type='negative')
+            self.refresh_project_list()
+
+    def request_delete_project(self) -> None:
+        if not self.write_access_allowed() or not self.pdf or not self.paths:
+            return
+        if GLOBAL_EXECUTION_LOCK.is_locked():
+            ui.notify('処理中のため，プロジェクトを削除できません．', type='warning')
+            return
+        pdf_path = self.pdf
+        project_name = self.project_display_name(pdf_path)
+        with ui.dialog() as dialog, ui.card().classes('p-5 gap-4 max-w-md'):
+            dialog.props('persistent')
+            with ui.row().classes('items-center gap-2 text-red-400'):
+                ui.icon('delete_forever', size='md')
+                ui.label('プロジェクトを完全に削除').classes('text-base font-bold')
+            ui.label(
+                f'「{project_name}」と，元PDF（{pdf_path.name}），生成済みの音声・動画・字幕・編集データを完全に削除します．この操作は取り消せません．'
+            ).classes('text-sm text-zinc-300 leading-relaxed')
+            with ui.row().classes('w-full justify-end gap-2 pt-2'):
+                ui.button('キャンセル', on_click=dialog.close).props('outline color=grey')
+
+                async def confirm_delete() -> None:
+                    dialog.close()
+                    await self.delete_project(pdf_path)
+
+                ui.button('完全に削除', on_click=confirm_delete).props('color=negative')
+        dialog.open()
+
+    async def delete_project(self, pdf_path: Path) -> None:
+        if not self.write_access_allowed():
+            return
+        if GLOBAL_EXECUTION_LOCK.is_locked():
+            ui.notify('処理中のため，プロジェクトを削除できません．', type='warning')
+            return
+        project_dir = pdf_path.parent.resolve()
+        if project_dir.parent != self.projects_dir.resolve() or not re.fullmatch(r"\d{8}\.[A-Za-z0-9_]{4,12}", project_dir.name):
+            ui.notify('削除対象のプロジェクトを確認できませんでした．', type='negative')
+            return
+        pdfs = [p for p in project_dir.glob('*.pdf') if p.is_file()]
+        if len(pdfs) != 1 or pdfs[0].resolve() != pdf_path.resolve():
+            ui.notify('削除対象の元PDFを確認できませんでした．', type='negative')
+            return
+        deleted_project_name = self.project_display_name(pdf_path)
+        deleted_id = project_dir.name
+        was_active = bool(self.pdf and self.pdf.resolve() == pdf_path.resolve())
+        try:
+            shutil.rmtree(project_dir)
+            remaining = self.list_user_projects()
+            marker = user_last_project_file(self.username)
+            if was_active:
+                self.pdf = None
+                self.paths = None
+                self.images = []
+                self.proj_cfg = {}
+                self.slide_visual_modes = {}
+                self._selected_pages.clear()
+                self.edit_page = None
+                self.mode_code = 'lecture'
+                self.lang_code = 'ja'
+                self.default_use_vlm = True
+                if remaining:
+                    await self.select_existing_project(remaining[0].parent.name)
+                else:
+                    marker.unlink(missing_ok=True)
+                    self.refresh_project_widgets()
+                    self.refresh_project_name_input()
+                    await self.refresh_all()
+            else:
+                try:
+                    last_id = json.loads(marker.read_text(encoding='utf-8')).get('project_id', '')
+                except (OSError, ValueError, TypeError):
+                    last_id = ''
+                if last_id == deleted_id:
+                    if remaining:
+                        marker.write_text(json.dumps({'project_id': remaining[0].parent.name}, ensure_ascii=False), encoding='utf-8')
+                    else:
+                        marker.unlink(missing_ok=True)
+            self.refresh_project_list()
+            ui.notify(f'プロジェクト「{deleted_project_name}」を完全に削除しました．', type='positive')
+        except Exception as exc:
+            ui.notify(f'プロジェクトの削除に失敗しました: {exc}', type='negative')
+            self.refresh_project_list()
+
+    # --- PDF 読み込み & 復元 ---
+
+    async def load_pdf(self, e) -> None:
+        """アップロードPDFごとに一意のIDを発行し，新規プロジェクトとして保存する．"""
+        if not self.write_access_allowed():
+            return
+        if GLOBAL_EXECUTION_LOCK.is_locked():
+            ui.notify('処理中は新しいプロジェクトを作成できません．', type='warning')
+            return
+        filename = Path(e.file.name).name
+        if not filename or filename in ('.', '..') or Path(filename).suffix.lower() != '.pdf':
+            ui.notify('PDFファイルを選択してください．', type='warning')
+            return
+
+        self.projects_dir.mkdir(parents=True, exist_ok=True)
+        while True:
+            project_id = datetime.now().strftime('%Y%m%d') + '.' + ''.join(secrets.choice('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_') for _ in range(6))
+            project_dir = self.projects_dir / project_id
+            try:
+                project_dir.mkdir()
+                break
+            except FileExistsError:
+                continue
+
+        target_pdf = project_dir / filename
+        temp_pdf = project_dir / '.upload.tmp'
+        try:
+            await e.file.save(temp_pdf)
+            if not self.write_access_allowed() or GLOBAL_EXECUTION_LOCK.is_locked():
+                shutil.rmtree(project_dir, ignore_errors=True)
+                ui.notify('権限または処理状態が変化したため，アップロードを中止しました．', type='warning')
+                return
+            temp_pdf.replace(target_pdf)
+            self.pdf = target_pdf
+            self.paths = ProjectPaths(target_pdf)
+            self.proj_cfg = load_project_json(self.paths.root)
+            self.proj_cfg.setdefault('project_name', target_pdf.stem)
+            self.proj_cfg['project_id'] = project_id
+            self.proj_cfg['source_pdf'] = filename
+            save_project_json(self.paths.root, self.proj_cfg)
+
+            marker = user_last_project_file(self.username)
+            temp_marker = marker.with_name(marker.name + '.tmp')
+            temp_marker.write_text(json.dumps({'project_id': project_id}, ensure_ascii=False), encoding='utf-8')
+            temp_marker.replace(marker)
+
+            self.mode_code = self.proj_cfg.get('mode') or self.cfg.get('mode', 'lecture')
+            self.lang_code = self.proj_cfg.get('language') or self.cfg.get('language', 'ja')
+            saved_vmode = self.proj_cfg.get('visual_mode') or self.cfg.get('visual_mode', 'vlm')
+            self.default_use_vlm = saved_vmode in ('vlm', 'auto', True, 'true')
+            self.slide_visual_modes = self.proj_cfg.get('slide_visual_modes', {})
+            self.images = await run.io_bound(ensure_page_images, self.paths, int(self.cfg.get('pdf', {}).get('dpi', 120)))
+            self.apply_pages_spec(self.proj_cfg.get('pages', ''), save_and_refresh=False)
+            self.refresh_project_widgets()
+            self.refresh_project_list()
+            self.refresh_project_name_input()
+            await self.refresh_all()
+            ui.notify(f'新しいプロジェクト「{self.project_display_name(target_pdf)}」を作成しました．', type='positive')
+        except Exception as exc:
+            # 不完全なアップロードだけを片付け，既存プロジェクトには触れない．
+            shutil.rmtree(project_dir, ignore_errors=True)
+            ui.notify(f'プロジェクトの作成に失敗しました: {exc}', type='negative')
+            self.refresh_project_list()
+
+    async def restore_last_project(self) -> None:
+        if self._restore_started:
+            return
+        self._restore_started = True
+        try:
+            marker = user_last_project_file(self.username)
+            try:
+                project_id = str(json.loads(marker.read_text(encoding='utf-8')).get('project_id', ''))
+            except (OSError, ValueError, TypeError):
+                project_id = ''
+            projects = self.list_user_projects()
+            if not project_id or not any(p.parent.name == project_id for p in projects):
+                if not projects:
+                    return
+                project_id = projects[0].parent.name
+                marker.write_text(json.dumps({'project_id': project_id}, ensure_ascii=False), encoding='utf-8')
+            await self.select_existing_project(project_id)
             if self.read_only:
                 safe_notify('利用可能時間外のため，閲覧モードでプロジェクトを復元しました．', type='info')
-        except FileNotFoundError:
-            return
         except Exception as exc:
             safe_notify(f'前回のプロジェクトを復元できませんでした: {exc}', type='warning')
 
     def refresh_project_widgets(self) -> None:
-        if not self.pdf:
-            return
         if self.mode_select:
             self.mode_select.value = self.mode_code
         if self.lang_select:
@@ -1039,9 +1184,12 @@ class SlideNarratorApp:
         if self.default_vlm_switch:
             self.default_vlm_switch.value = self.default_use_vlm
         if self.pages_input:
-            self.pages_input.value = self.pages_spec
+            self.pages_input.value = self.pages_spec if self.pdf else ''
         if self.active_count_label:
-            self.active_count_label.text = f'対象スライド: {len(self._selected_pages)} / {self.total_slides} スライド'
+            if self.pdf:
+                self.active_count_label.text = f'対象スライド: {len(self._selected_pages)} / {self.total_slides} スライド'
+            else:
+                self.active_count_label.text = '対象スライド: 0 / 0 スライド'
 
     def save_project_settings(self) -> None:
         if not self.write_access_allowed() or not self.paths:
@@ -2248,6 +2396,53 @@ class SlideNarratorApp:
 
         return llm_base, llm_key, llm_model_select, llm_temp
 
+    @staticmethod
+    def _fetch_voices_from_server(base_url: str, api_key: str) -> list[str]:
+        url_clean = base_url.rstrip('/')
+        candidate_urls = [
+            f"{url_clean}/audio/voices",
+            f"{url_clean}/voices",
+        ]
+        if url_clean.endswith('/v1'):
+            root_url = url_clean[:-3]
+            candidate_urls.extend([
+                f"{root_url}/audio/voices",
+                f"{root_url}/voices",
+            ])
+
+        headers = {'Authorization': f'Bearer {api_key}'} if api_key and api_key != 'dummy' else {}
+
+        with httpx.Client(trust_env=False, verify=False, timeout=8.0) as client:
+            for endpoint in candidate_urls:
+                try:
+                    resp = client.get(endpoint, headers=headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        voices: list[str] = []
+                        if isinstance(data, list):
+                            for item in data:
+                                if isinstance(item, str):
+                                    voices.append(item)
+                                elif isinstance(item, dict):
+                                    v_id = item.get('id') or item.get('voice_id') or item.get('name')
+                                    if v_id:
+                                        voices.append(str(v_id))
+                        elif isinstance(data, dict):
+                            v_list = data.get('voices') or data.get('data') or []
+                            if isinstance(v_list, list):
+                                for item in v_list:
+                                    if isinstance(item, str):
+                                        voices.append(item)
+                                    elif isinstance(item, dict):
+                                        v_id = item.get('id') or item.get('voice_id') or item.get('name')
+                                        if v_id:
+                                            voices.append(str(v_id))
+                        if voices:
+                            return sorted(set(voices))
+                except Exception:
+                    continue
+        return []
+
     def _build_tts_settings(self) -> tuple[tuple[ui.input, ui.input, ui.select, ui.select], tuple[ui.input, ui.input, ui.select, ui.select]]:
         tts = self.cfg.setdefault('tts', {})
         ja = tts.setdefault('ja', {})
@@ -2790,25 +2985,43 @@ class SlideNarratorApp:
 
         # 左サイドドロワー
         with ui.left_drawer(value=True).props('width=320').classes('p-4'):
-            ui.label('プロジェクト設定').classes('text-h5')
             if self.read_only:
                 ui.label('閲覧モード：利用可能時間外のため編集・生成はできません．').classes('text-sm text-amber-400')
             ui.timer(2.0, self.refresh_job_status)
 
+            # --- 変更点: 見た目のフォームは消し、不可視化して裏方に回す ---
             self.uploader = (
                 ui.upload(
-                    label='プレゼンテーションPDFを選択',
                     auto_upload=True,
                     max_files=1,
                     on_upload=self.load_pdf,
                 )
                 .props('accept=.pdf')
-                .classes('w-full')
+                .classes('hidden')  # 画面上には表示しない
             )
             if self.read_only:
                 self.uploader.disable()
 
             self.uploader.on('added', lambda: self.uploader.run_method('eval', 'if (this.files.length > 1) { this.removeFile(this.files[0]); }'))
+
+            # 上部にあった余分な separator も整理可能
+            with ui.row().classes('w-full items-center justify-between mt-2'):
+                ui.label('プロジェクト').classes('text-h6')
+                with ui.row().classes('items-center gap-1'):
+                    add_project_button = ui.button(icon='add', on_click=lambda: self.uploader.run_method('pickFiles')).props('flat dense round size=sm')
+                    add_project_button.tooltip('PDFを追加して新しいプロジェクトを作成')
+                    with ui.button(icon='more_vert').props('flat dense round size=sm'):
+                        with ui.menu():
+                            ui.menu_item('名前を変更', on_click=self.request_rename_project).props('dense')
+                            ui.menu_item('完全削除', on_click=self.request_delete_project).props('dense')
+            self.project_select = ui.select(
+                options={}, value=None, label='プロジェクトを選択',
+                on_change=lambda e: asyncio.create_task(self.select_existing_project(e.value)),
+            ).props('outlined dense options-dense').classes('w-full')
+            if self.read_only:
+                add_project_button.disable()
+            self.refresh_project_list()
+            self.refresh_project_name_input()
 
             self.mode_select = ui.radio({'lecture': '🎓 講義', 'research': '🔬 研究発表'}, value=self.mode_code).props('inline')
             self.mode_select.on_value_change(lambda e: self._mode_changed(e.value))
@@ -2912,9 +3125,9 @@ class SlideNarratorApp:
                     with ui.row().classes('w-full items-center justify-between pb-2'):
                         ui.label('📜 実行ログ履歴').classes('text-h5')
                         ui.button('ログをクリア', on_click=self.clear_job_log).props('dense outline size=sm color=negative')
-                    self.history_log_widget = ui.column().classes('w-full h-[650px] overflow-y-auto flex-nowrap gap-0 bg-zinc-900 border border-zinc-700 rounded-lg p-3')
-                    self._loaded_log_text = None
+                    self.history_log_widget = ui.log(max_lines=2000).classes('w-full h-[650px] font-mono text-xs bg-zinc-900 border border-zinc-700 rounded-lg p-3')
                     self.refresh_history_log()
+
                 if is_admin and not self.read_only:
                     with ui.tab_panel(tab_settings):
                         self.settings_container = ui.column().classes('w-full')
